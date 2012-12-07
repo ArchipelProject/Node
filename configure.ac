@@ -1,13 +1,13 @@
-AC_INIT([ovirt-node], [2.3.0], [node-devel@ovirt.org])
+AC_INIT([ovirt-node], [2.5.999], [node-devel@ovirt.org])
 AM_INIT_AUTOMAKE([-Wall -Werror foreign -Wno-portability tar-pax])
 
 AC_SUBST([FEDORA],[[`rpm --eval '%{fedora}'|sed 's/[^0-9]//g'`]])
 AC_SUBST([RHEL], [[`rpm --eval '%{rhel}'|sed 's/[^0-9]//g'`]])
 AC_SUBST([CENTOS], [[`rpm --eval '%{centos}'|sed 's/[^0-9]//g'`]])
+AC_SUBST([DRACUTDIR], [[`test -e /usr/share/dracut && echo "/usr/share/dracut/modules.d" || echo "/usr/lib/dracut/modules.d"`]])
 AC_SUBST([DISTRO])
 AC_SUBST([PACKAGE_NAME])
 AC_SUBST([PRODUCT_NAME])
-
 
 if test "$FEDORA"; then
     DISTRO=ovirt$FEDORA
@@ -18,6 +18,12 @@ fi
 if test "$CENTOS"; then
     DISTRO=centos$CENTOS
 fi
+
+AM_CONDITIONAL(TARGET_FEDORA, test x"$FEDORA" != x)
+AM_CONDITIONAL(TARGET_RHEL, test x"$RHEL" != x)
+AM_CONDITIONAL(TARGET_CENTOS, test x"$CENTOS" != x)
+AM_CONDITIONAL(TARGET_SYSTEMD, test 0$RHEL -ge 7 || test 0$FEDORA -ge 16 || test 0$CENTOS -ge 7)
+
 
 AC_ARG_WITH([image-minimizer], [AC_HELP_STRING([--with-image-minimizer],
             [enable aggresive reduction of the image size])],
@@ -49,6 +55,7 @@ else
     MAIN_KS=recipe/ovirt-node-image.ks
 fi
 
+AM_PATH_PYTHON
 
 AC_CONFIG_FILES([Makefile
                 dracut/Makefile
@@ -57,8 +64,13 @@ AC_CONFIG_FILES([Makefile
                 scripts/Makefile
                 tools/Makefile
                 scripts/collectd.conf
+                services/Makefile
                 recipe/Makefile
+                logrotate/Makefile
+                modules/Makefile
+                plugins/Makefile
                 $MAIN_KS
                 recipe/image-minimizer.ks
+                scripts/ovirt-functions
                 ovirt-node.spec])
 AC_OUTPUT

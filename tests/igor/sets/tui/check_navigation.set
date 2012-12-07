@@ -1,0 +1,10 @@
+---
+description: 'Do some basic TUI checks'
+libs: ['../../libs/common', '../../libs/uinput']
+searchpath: '../../tcs'
+
+
+---
+filename: 'uinput/enter_all_top_menus.py'
+
+---

@@ -5,10 +5,6 @@
 generic-logos
 # Fedora only packages
 collectd-virt
-libvirt-qmf
-# install selected Matahari agents and the broker
-matahari-broker
-matahari-host
 #
 anyterm
 glusterfs-client
@@ -24,3 +20,14 @@ vdsm-reg
 ltrace
 # keyboard layout
 system-config-keyboard-base
+# plymouth stuff
+plymouth
+plymouth-system-theme
+plymouth-plugin-label
+plymouth-graphics-libs
+plymouth-scripts
+plymouth-plugin-two-step
+plymouth-theme-charge
+
+# urwid - for the alternate tui
+python-urwid

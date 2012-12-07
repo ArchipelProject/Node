@@ -54,6 +54,7 @@ if [ -f /usr/bin/rpmbuild ]; then
   rpmbuild --nodeps --define "extra_release $EXTRA_RELEASE" -ta --clean *.tar.gz
 fi
 
+mkdir -p ${AUTOBUILD_PACKAGE_ROOT}/rpm/RPMS
 # regenerate repo so iso uses new ovirt-node rpms
 createrepo -d ${AUTOBUILD_PACKAGE_ROOT}/rpm/RPMS
 
@@ -72,7 +73,7 @@ ln -nf *iso .. ||:
 #Don't error out if this doesn't work.
 set +e
 TMPDIR=$(mktemp -d)
-sudo mount -o loop *iso $TMPDIR
+sudo mount -o loop ovirt-node-image.iso $TMPDIR
 cp $TMPDIR/isolinux/manifest-srpm.txt ..
 cp $TMPDIR/isolinux/manifest-rpm.txt ..
 cp $TMPDIR/isolinux/manifest-file.txt.bz2 ..

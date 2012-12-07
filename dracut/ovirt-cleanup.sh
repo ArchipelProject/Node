@@ -25,7 +25,7 @@ else
 fi
 
 if [ "$fb" = "no" -o "$fb" = 0 ]; then
-    info "firtboot reinstall or uninstall parameter set to 0 or no, exitting"
+    info "firtboot reinstall or uninstall parameter set to 0 or no, exiting"
     return 0
 fi
 info "Found valid firstboot reinstall or uninstall parameter"
@@ -75,16 +75,68 @@ info "Escaped all asterisks:  $storage_init"
 oldIFS=$IFS
 
 IFS=","
+parsed_storage_init=""
+info "Parsing storage_init: $storage_init"
 for dev in $storage_init; do
     dev="$(echo "$dev" | sed 's/\\\*/\*/g')"
     device=$(IFS=$oldIFS parse_disk_id "$dev")
     info "After parsing \"$dev\", we got \"$device\""
-    echo "Wiping LVM from device: ${device}"
+    parsed_storage_init="$parsed_storage_init,$device"
+done
+parsed_storage_init=${parsed_storage_init#,}
+
+lvm_storage_init=""
+info "Finding all affected PVs for: $parsed_storage_init"
+for device in $parsed_storage_init; do
+    if [ -z "$device" ]; then
+        continue
+    fi
+    info "Looking for device and partitions on '$device'"
     IFS=$oldIFS
-    for i in $(lvm pvs --noheadings -o pv_name,vg_name --separator=, $device* 2>/dev/null); do
+    for slave in $(ls $device*); do
+        info " Found '$slave'"
+        lvmslave=$(IFS=$oldIFS lvm_name_for "$slave")
+        if [ -n "$lvmslave" ]; then
+            info "  Known by LVM as '$lvmslave'"
+            lvm_storage_init="$lvm_storage_init,$lvmslave"
+        else
+            info "  '$slave' is unknown to LVM"
+        fi
+    done
+    IFS=,
+done
+lvm_storage_init=${lvm_storage_init#,}
+
+for device in $lvm_storage_init; do
+    if [ -z "$device" ]; then
+        continue
+    fi
+    echo "Wiping LVM from device: ${device}"
+    # Ensure that it's not read-only locking
+    if [ -f "/etc/lvm/lvm.conf" ]; then
+        sed -i "s/locking_type =.*/locking_type = 0/" /etc/lvm/lvm.conf
+    fi
+    IFS=$oldIFS
+    for i in $(lvm pvs --noheadings -o pv_name,vg_name --separator=, $device 2>/dev/null); do
         pv="${i%%,*}"
         vg="${i##*,}"
         if [ -n "$vg" ]; then
+            info "Checking all PVs of VG '$vg'"
+            for ipv in $(lvm vgs --noheadings -o pv_name $vg 2>/dev/null); do
+                imach=0
+                IFS=","
+                for idev in $lvm_storage_init; do
+                     if [ $idev = $ipv ]; then
+                        imach=1
+                     fi
+                done
+                IFS=$oldIFS
+                if [ $imach -eq 0 ]; then
+                    warn "LV '$lv' is not a member of VG '$vg'"
+                    die "Not all member PVs of '$vg' are given in the storage_init parameter, exiting"
+                    return 0
+                fi
+            done
             info "Found and removing vg: $vg"
             yes | lvm vgremove -ff "$vg"
         fi
@@ -92,6 +144,9 @@ for dev in $storage_init; do
         yes | lvm pvremove -ff "$pv"
     done
     IFS=,
+    if [ -f "/etc/lvm/lvm.conf" ]; then
+        sed -i "s/locking_type =.*/locking_type = 4/" /etc/lvm/lvm.conf
+    fi
 done
 
 IFS=$oldIFS

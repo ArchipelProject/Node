@@ -15,58 +15,87 @@
 # MA  02110-1301, USA.  A copy of the GNU General Public License is
 # also available at http://www.gnu.org/copyleft/gpl.html.
 
-EXTRA_DIST = \
-  node-config \
-  ovirt-awake.init \
-  ovirt-awake.service \
-  ovirt-early.init \
-  ovirt-early.service \
-  ovirt.init \
-  ovirt.service \
-  ovirt-post.init \
-  ovirt-post.service \
-  ovirt-firstboot.init \
-  ovirt-firstboot.service \
-  ovirt-cim.init \
-  ovirt-cim.service \
-  cim.py \
-  local_boot_trigger.sh \
-  augeas.py \
-  __init__.py \
-  ovirtfunctions.py \
-  install.py \
-  storage.py \
-  iscsi.py \
-  network.py \
-  password.py \
-  collectd.py \
-  log.py \
-  kdump.py \
-  rhn.py \
-  snmp.py \
-  ovirt-config-installer.py \
-  ovirt-config-setup.py \
-  ovirt-auto-install.py \
-  ovirt-admin-shell
+nodeconfdir = $(sysconfdir)/sysconfig
+localboottriggerdir=$(sysconfdir)/ovirt-config-boot.d
+
+dist_nodeconf_DATA = \
+  node-config
 
 dist_sbin_SCRIPTS = \
   persist \
   unpersist
 
 dist_libexec_SCRIPTS = \
-  ovirt-config-boot \
-  ovirt-config-hostname \
-  ovirt-config-iscsi \
-  ovirt-config-kdump \
-  ovirt-config-logging \
-  ovirt-config-networking \
-  ovirt-config-rhn \
   ovirt-config-password \
-  ovirt-config-storage \
   ovirt-config-uninstall \
-  ovirt-config-view-logs \
   ovirt-functions \
-  ovirt-boot-functions \
-  ovirt-process-config \
   ovirt-rpmquery \
-  ovirt-init-functions.sh
+  ovirt-init-functions.sh \
+  ovirt-config-installer.py \
+  ovirt-config-setup.py \
+  ovirt-auto-install.py \
+  ovirt-admin-shell
+
+# default hook for local_boot_trigger
+dist_localboottrigger_SCRIPTS = \
+  local_boot_trigger.sh
+
+install-exec-hook:
+	mv $(DESTDIR)$(libexecdir)/ovirt-config-installer.py $(DESTDIR)$(libexecdir)/ovirt-config-installer
+	mv $(DESTDIR)$(libexecdir)/ovirt-config-setup.py $(DESTDIR)$(libexecdir)/ovirt-config-setup
+	mv $(DESTDIR)$(libexecdir)/ovirt-auto-install.py $(DESTDIR)$(libexecdir)/ovirt-auto-install
+	mkdir -p --mode=0755 \
+	  $(DESTDIR)$(localboottriggerdir) \
+	  $(DESTDIR)$(sysconfdir)/node.d \
+	  $(DESTDIR)$(sysconfdir)/ovirt-early.d \
+	  $(DESTDIR)$(sysconfdir)/ovirt-commandline.d \
+	  $(DESTDIR)$(sysconfdir)/default
+	echo "# File where default configuration is kept" > $(DESTDIR)$(sysconfdir)/default/ovirt
+
+#
+# newt tui
+#
+pyovirtconfigsetupdir =$(pythondir)/ovirt_config_setup
+pyovirtconfigsetup_PYTHON = \
+  ovirt_config_setup/__init__.py \
+  ovirt_config_setup/cim.py \
+  ovirt_config_setup/plugins.py
+
+if TARGET_FEDORA
+pyovirtconfigsetup_PYTHON += \
+  collectd.py
+endif
+
+if TARGET_CENTOS
+pyovirtconfigsetup_PYTHON += \
+  collectd.py
+endif
+
+if TARGET_RHEL
+pyovirtconfigsetup_PYTHON += \
+  rhn.py
+endif
+
+pyovirtnodedir = $(pythondir)/ovirtnode
+pyovirtnode_PYTHON = \
+  ovirtnode/__init__.py \
+  ovirtnode/install.py \
+  ovirtnode/iscsi.py \
+  ovirtnode/kdump.py \
+  ovirtnode/log.py \
+  ovirtnode/network.py \
+  ovirtnode/ovirtfunctions.py \
+  ovirtnode/password.py \
+  ovirtnode/storage.py
+
+EXTRA_DIST = \
+  augeas.py
+
+# Requires python-pep8 package (Fedora)
+check-local: check-local-pep8
+
+check-local-pep8:
+	find $(srcdir) -name \*.py | sort | uniq | xargs pep8 --repeat --statistics --count
+
+check-local-doctest:
+	find $(srcdir) -name \*.py | sort | uniq | xargs python -m doctest -v

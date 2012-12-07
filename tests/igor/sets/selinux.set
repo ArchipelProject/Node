@@ -1,0 +1,10 @@
+---
+description: 'Does some basic selinux checks'
+libs: ['../libs/common']
+searchpath: '../tcs'
+
+
+---
+filename: 'selinux-denials.sh'
+
+---

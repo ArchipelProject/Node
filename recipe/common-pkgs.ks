@@ -52,7 +52,6 @@ setools-console
 -prelink
 -newt
 -libselinux-python
--kbd
 -usermode
 -gzip
 -less
@@ -78,8 +77,6 @@ less
 dosfstools
 # kdump
 kexec-tools
-# SNMP support rhbz#614870
-net-snmp
 # qlogic firmware
 ql2100-firmware
 ql2200-firmware
@@ -113,3 +110,17 @@ efibootmgr
 # libvirt-cim
 sblim-sfcb
 libvirt-cim
+# yum for plugins
+yum
+# Consistent ethernet device naming
+biosdevname
+# yum for plugins
+yum
+fcoe-utils
+#glusterfs client packages
+glusterfs
+glusterfs-devel
+glusterfs-fuse
+glusterfs-rdma
+# mom for SLA
+mom

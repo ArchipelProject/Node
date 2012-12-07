@@ -1,0 +1,39 @@
+#!/bin/bash
+#
+# ovirt Start ovirt services
+#
+### BEGIN INIT INFO
+# Provides: ovirt-post
+# Required-Start: ovirt libvirtd
+# Default-Start: 2 3 4 5
+# Description: Performs managed node post configuration setup.
+### END INIT INFO
+
+# Source functions library
+. /usr/libexec/ovirt-init-functions.sh
+
+prog=ovirt-post
+
+case "$1" in
+    start)
+        echo -n "Starting ovirt-post: "
+        start_ovirt_post
+        test $? == 0 && success || failure
+        echo
+        ;;
+    status)
+        status -l $prog
+        ;;
+    reload)
+        reload_ovirt_post
+        ;;
+    stop)
+        echo -n "Stopping ovirt-post: "
+        stop_ovirt_post
+        test $? == 0 && success || failure
+        echo
+        ;;
+    *)
+        echo "Usage: ovirt-post {start}"
+        exit 2
+esac

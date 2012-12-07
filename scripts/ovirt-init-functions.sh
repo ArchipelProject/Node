@@ -24,7 +24,7 @@
 . /etc/init.d/functions
 . /usr/libexec/ovirt-functions
 
-. /usr/libexec/ovirt-boot-functions
+. /usr/lib/dracut/modules.d/91ovirtnode/ovirt-boot-functions
 
 NODE_CONFIG=/etc/sysconfig/node-config
 
@@ -32,6 +32,7 @@ VAR_SUBSYS_OVIRT_EARLY=/var/lock/subsys/ovirt-early
 VAR_SUBSYS_NODECONFIG=/var/lock/subsys/node-config
 VAR_SUBSYS_OVIRT_POST=/var/lock/subsys/ovirt-post
 VAR_SUBSYS_OVIRT_CIM=/var/lock/subsys/ovirt-cim
+VAR_SUBSYS_OVIRT=/var/lock/subsys/ovirt
 
 BONDING_MODCONF_FILE=/etc/modprobe.d/bonding
 AUGTOOL_CONFIG=/var/tmp/augtool-config
@@ -103,7 +104,11 @@ configure_ovirt_management_nic() {
     else
         # for non-PXE boot when BOOTIF parameter is not specified
         # otherwise default network config is invalid
-        DEVICE=eth0
+        # set to the first interface on the system
+        DEVICE=`/sbin/biosdevname -d | awk 'FNR == 2 {print $3}'`
+        if [ -z $DEVICE ]; then
+            DEVICE=eth0
+        fi
     fi
     # default oVirt network configuration:
     # bridge each ethernet device in the system
@@ -138,8 +143,11 @@ configure_management_interface() {
                     $BONDING_MODCONF_FILE
                 if [ $upgrade = 1 ]; then
                     # local disk installation for managed mode
-                    mount_live
-                    /usr/libexec/ovirt-config-boot /live "$bootparams"
+                    python <<EOP
+from ovirtnode.install import Install
+install = Install()
+install.ovirt_boot_setup()
+EOP
                 fi
             fi
             ;;
@@ -202,6 +210,7 @@ _start_ovirt_early () {
     #   rhn_password=RHN-PASSWORD
     #   rhn_profile=RHNPROFILE
     #   rhn_activationkey=ACTIVATIONKEY
+    #   rhn_org=ORG
     # RHN registration, activation key takes precedence
     #   rhn_proxy=PROXY-HOST:PORT
     #   rhn_proxyuser=PROXY-USERNAME
@@ -389,11 +398,12 @@ _start_ovirt_early () {
             BOOTIF=*)
             i=${i#BOOTIF=}
             case "$i" in
-                eth*)
+                [ep]*)
                 bootif=$i
                 ;;
                 link)
-                for eth in $(cd /sys/class/net; echo eth*); do
+                for eth in $(cd /sys/class/net; echo [ep]*); do
+                    ip link set dev $eth up
                     if ethtool $eth 2>/dev/null|grep -q "Link detected: yes"
                     then
                         bootif=$eth
@@ -403,7 +413,7 @@ _start_ovirt_early () {
                 ;;
                 ??-??-??-??-??-??-??)
                 i=${i#??-}
-                bootif=$(grep -il $(echo $i|sed 's/-/:/g') /sys/class/net/eth*/address|rev|cut -d/ -f2|rev)
+                bootif=$(grep -il $(echo $i|sed 's/-/:/g') /sys/class/net/[ep]*/address|rev|cut -d/ -f2|rev)
                 ;;
             esac
             ;;
@@ -423,9 +433,6 @@ _start_ovirt_early () {
                     init=
                     for d in $hostvgdisks; do
                         did="$(IFS="$oldIFS" parse_disk_id "$d")"
-                        if [ -z "$did" -a $iscsi_install == 1 ]; then
-                            autoinstall_failed
-                        fi
                         if [ -n "$init" ]; then
                             init="$init${SEP}$did"
                         else
@@ -460,17 +467,20 @@ _start_ovirt_early () {
             storage_vol* | ovirt_vol=*)
             i=${i#ovirt_vol=}
             i=${i#storage_vol=}
-            eval $(printf $i|awk -F: '{ print "lv1="$1; print "lv2="$2; print "lv3="$3; print "lv4="$4; print "lv5="$5; print "lv6="$6; print "lv7="$7; print "lv8="$8; }')
+            eval $(printf $i|awk -F: '{ print "lv1="$1; print "lv2="$2; print "lv3="$3; print "lv4="$4; print "lv5="$5; print "lv6="$6; print "lv7="$7; print "lv8="$8; print "lv9="$9; }')
             # Reads each provided LV size and assign them
             # NOTE: Boot and Root size are ignored by o-c-storage
-            for p in $(seq 1 8); do
+            for p in $(seq 1 9); do
                 var=lv$p
                 size=
                 lv=
                 if [ -n "${!var}" ]; then
-                    eval $(printf '${!var}'|awk -F, '{ print "size="$1; print "lv="$2; }')
+                    eval $(printf "${!var}"|awk -F, '{ print "size="$1; print "lv="$2; }')
                     if [ -n "${size}" ]; then
                         case "${lv}" in
+                            EFI)
+                            vol_efi_size=$size
+                            ;;
                             Boot)
                             vol_boot_size=$size
                             ;;
@@ -541,7 +551,7 @@ _start_ovirt_early () {
             fi
             if ! grep -q ^cim /etc/passwd; then
                 unmount_config /etc/passwd /etc/shadow
-                useradd -g cim -s /usr/libexec/ovirt-admin-shell cim
+                useradd -G sfcb -g cim -s /sbin/nologin cim
                 persist /etc/shadow /etc/passwd
             fi
             ;;
@@ -685,6 +695,9 @@ _start_ovirt_early () {
             rhn_proxypassword=*)
             rhn_proxypassword=${i#rhn_proxypassword=}
             ;;
+            rhn_org=*)
+            rhn_org=${i#rhn_org=}
+            ;;
             ovirt_early=*)
             bootparams="$bootparams $i"
             i=${i#ovirt_early=}
@@ -783,10 +796,16 @@ _start_ovirt_early () {
 
 
     # save boot parameters as defaults for ovirt-config-*
-    params="bootif init init_app vol_boot_size vol_swap_size vol_root_size vol_config_size vol_logging_size vol_data_size vol_swap2_size vol_data2_size crypt_swap crypt_swap2 upgrade standalone overcommit ip_address ip_netmask ip_gateway ipv6 dns ntp vlan ssh_pwauth syslog_server syslog_port collectd_server collectd_port bootparams hostname firstboot rhn_type rhn_url rhn_ca_cert rhn_username rhn_password rhn_profile rhn_activationkey rhn_proxy rhn_proxyuser rhn_proxypassword runtime_mode kdump_nfs iscsi_name snmp_password install netconsole_server netconsole_port stateless cim_enabled wipe_fakeraid iscsi_init iscsi_target_name iscsi_target_host iscsi_target_port iscsi_install"
+    params="bootif init init_app vol_boot_size vol_efi_size vol_swap_size vol_root_size vol_config_size vol_logging_size vol_data_size vol_swap2_size vol_data2_size crypt_swap crypt_swap2 upgrade standalone overcommit ip_address ip_netmask ip_gateway ipv6 dns ntp vlan ssh_pwauth syslog_server syslog_port collectd_server collectd_port bootparams hostname firstboot rhn_type rhn_url rhn_ca_cert rhn_username rhn_password rhn_profile rhn_activationkey rhn_org rhn_proxy rhn_proxyuser rhn_proxypassword runtime_mode kdump_nfs iscsi_name snmp_password install netconsole_server netconsole_port stateless cim_enabled wipe_fakeraid iscsi_init iscsi_target_name iscsi_target_host iscsi_target_port iscsi_install"
     # mount /config unless firstboot is forced
     if [ "$firstboot" != "1" ]; then
         mount_config
+        # convert ethX to biosdevnames before mounting config files
+        python <<EOP
+from ovirtnode.network import convert_to_biosdevname
+convert_to_biosdevname()
+EOP
+
     fi
     log "Updating $OVIRT_DEFAULTS"
     tmpaug=$(mktemp)
@@ -811,6 +830,13 @@ _start_ovirt_early () {
         fi
     fi
 
+    [[ -f "/etc/udev/rules.d/71-persistent-node-net.rules" ]] && {
+        # Rename the interfaces after bind-mounting the udev rules, rhbz#831658
+        rm -f /etc/udev/rules.d/70-persistent-net.rules
+        udevadm control --reload-rules
+        udevadm trigger --action=add --subsystem-match=net
+    }
+
     if [ -n "$cim_passwd" ]; then
         log "Setting temporary admin password: $cim_passwd"
         unmount_config /etc/passwd /etc/shadow
@@ -831,13 +857,13 @@ _start_ovirt_early () {
     # check if root or admin password is expired, this might be upon reboot
     # in case of automated installed with rootpw or adminpw parameter!
     if LC_ALL=C chage -l root | grep  -q "password must be changed" \
-        || LC_ALL=c chage -l admin | grep -q "password must be changed"; then
+        || LC_ALL=C chage -l admin | grep -q "password must be changed"; then
         unmount_config /etc/passwd /etc/shadow
         # PAM will force password change at first login
         # so make sure we persist it after a successful login
         cat >> /etc/profile << EOF
 # added by ovirt-early
-if [ "$USER" = "root" -o "$USER" = "admin" ]; then
+if [ "\$USER" = "root" -o "\$USER" = "admin" ]; then
     sudo persist /etc/passwd /etc/shadow
     if LC_ALL=C sudo chage -l root | grep  -q "password must be changed" \
         || LC_ALL=C sudo chage -l admin | grep -q "password must be changed"; then
@@ -893,8 +919,7 @@ EOF
 }
 
 stop_ovirt_early () {
-    echo -n "Stopping ovirt-early: "
-    success
+    return 0
 }
 
 reload_ovirt_early () {
@@ -1005,8 +1030,7 @@ start_ovirt_awake () {
 }
 
 stop_ovirt_awake () {
-    echo -n "Stopping ovirt-awake: "
-    success
+    return 0
 }
 
 reload_ovirt_awake () {
@@ -1080,7 +1104,11 @@ start_ovirt_firstboot ()
         check_version
         # auto install covers this already
         if ! is_auto_install; then
-            /usr/libexec/ovirt-config-boot /live "$OVIRT_BOOTPARAMS" no
+            python <<EOP
+from ovirtnode.install import Install
+install = Install()
+install.ovirt_boot_setup()
+EOP
         fi
         if [ $? -ne 0 ]; then
             autoinstall_failed
@@ -1118,11 +1146,10 @@ reload_ovirt_firstboot () {
     start_ovirt_firstboot
 }
 
+
 #
 # ovirt
 #
-VAR_SUBSYS_OVIRT=/var/lock/subsys/ovirt
-
 ovirt_start() {
     if is_standalone; then
         return 0
@@ -1158,21 +1185,6 @@ ovirt_start() {
         log "skipping collectd configuration, collectd service not available"
     fi
 
-    find_srv qpidd tcp
-    if [ -n "$SRV_HOST" -a -n "$SRV_PORT" ]; then
-        libvirt_qpid_conf=/etc/sysconfig/libvirt-qpid
-        if [ -f $libvirt_qpid_conf ]; then
-            echo "LIBVIRT_QPID_ARGS=\"--broker $SRV_HOST --port $SRV_PORT\"" >> $libvirt_qpid_conf
-            echo "/usr/kerberos/bin/kinit -k -t /etc/libvirt/krb5.tab qpidd/`hostname`" >> $libvirt_qpid_conf
-        fi
-        matahari_conf=/etc/sysconfig/matahari
-        if [ -f $matahari_conf ]; then
-            echo "MATAHARI_ARGS=\"--broker $SRV_HOST --port $SRV_PORT\"" >> $matahari_conf
-            echo "/usr/kerberos/bin/kinit -k -t /etc/libvirt/krb5.tab qpidd/`hostname`" >> $matahari_conf
-        fi
-    else
-        log "skipping libvirt-qpid and matahari configuration, could not find $libvirt_qpid_conf"
-    fi
 }
 
 start_ovirt () {
@@ -1215,31 +1227,23 @@ start_ovirt_post() {
     [ -f "$VAR_SUBSYS_OVIRT_POST" ] && exit 0
     {
         log "Starting ovirt-post"
-        # wait for libvirt to finish initializing
-        local count=0
-        while true; do
-            if virsh connect qemu:///system --readonly >/dev/null 2>&1; then
-                break
-            elif [ "$count" == "100" ]; then
-                log "Libvirt did not initialize in time..."
-                return 1
-            else
-                log "Waiting for libvirt to finish initializing..."
-                count=$(expr $count + 1)
-                sleep 1
-            fi
 
-            touch $VAR_SUBSYS_OVIRT_POST
+        # Re-load keyboard settings
+        load_keyboard_config 2> /dev/null
 
-        done
+        # Rewrite resolv.conf, rhbz#742365
+        configure_dns
+
+        # Create a minimalistic /etc/hosts if it's empty, rhbz#829753
+        create_minimal_etc_hosts_file
+
         BACKUP=$(mktemp)
         ISSUE=/etc/issue
         ISSUE_NET=/etc/issue.net
         egrep -v "[Vv]irtualization hardware" $ISSUE > $BACKUP
         cp -f $BACKUP $ISSUE
         rm $BACKUP
-        hwvirt=$(virsh --readonly capabilities)
-        if [[ $hwvirt =~ kvm ]]; then
+        if [ -e /dev/kvm ] && lsmod | egrep -q "kvm_intel|kvm_amd"; then
             log "Hardware virtualization detected"
         else
             log "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
@@ -1261,9 +1265,16 @@ start_ovirt_post() {
         fi
         cp -f $ISSUE $ISSUE_NET
 
-        # Small hack to fix https://bugzilla.redhat.com/show_bug.cgi?id=805313
+        # Hack to fix rhbz#844997
+        mount --make-rshared /
 
+        # Small hack to fix https://bugzilla.redhat.com/show_bug.cgi?id=805313
         service network restart 2>/dev/null
+
+        # Restarting netconsole, now that the network is up, rhbz#869984
+        [[ -f "/config/etc/sysconfig/netconsole" ]] && {
+            service netconsole restart
+        }
 
         if is_standalone; then
             return 0
@@ -1282,9 +1293,20 @@ start_ovirt_post() {
         # successfull boot from /dev/HostVG/Root
         if grep -q -w root=live:LABEL=Root /proc/cmdline; then
             # set first boot entry as permanent default
-            ln -snf /dev/.initramfs/live/grub /boot/grub
             mount -o rw,remount LABEL=Root /dev/.initramfs/live > /tmp/grub-savedefault.log 2>&1
-            echo "savedefault --default=0" | grub >> /tmp/grub-savedefault.log 2>&1
+            if [[ -f "/etc/default/grub" ]];
+            then
+                # if grub2: GRUB_DEFAULT=saved in Fedora, thus it's already the way we need it
+                # rhbz#790532
+                {
+                    echo "grub2 is used:"
+                    egrep "^GRUB_DEFAULT" /etc/default/grub
+                } >> /tmp/grub-savedefault.log 2>&1
+            else
+                # if we are using legacy grub:
+                ln -snf /dev/.initramfs/live/grub /boot/grub
+                echo "savedefault --default=0" | grub >> /tmp/grub-savedefault.log 2>&1
+            fi
             mount -o ro,remount LABEL=Root /dev/.initramfs/live >> /tmp/grub-savedefault.log 2>&1
         fi
 
@@ -1299,8 +1321,7 @@ start_ovirt_post() {
 }
 
 stop_ovirt_post () {
-    echo -n "Stopping ovirt-post: "
-    success
+    return 0
 }
 
 reload_ovirt_post () {
@@ -1331,12 +1352,15 @@ start_ovirt_cim() {
 }
 
 stop_ovirt_cim () {
-    echo -n "Stopping ovirt-cim: "
-    if service sblim-sfcb status >/dev/null; then
-        python -c 'from ovirtnode.ovirtfunctions import *; manage_firewall_port("5989","close","tcp")'
-        service sblim-sfcb stop
-    fi
-    success
+    {
+        log "Stopping ovirt-cim"
+        if service sblim-sfcb status >/dev/null;
+        then
+            python -c 'from ovirtnode.ovirtfunctions import *; manage_firewall_port("5989","close","tcp")'
+            service sblim-sfcb stop
+        fi
+        log "Stopped ovirt-cim"
+    } >> $OVIRT_LOGFILE 2>&1
 }
 
 reload_ovirt_cim () {
@@ -1344,8 +1368,26 @@ reload_ovirt_cim () {
     start_ovirt_cim
 }
 
+status_ovirt_cim () {
+    service sblim-sfcb status > /dev/null 2>&1
+    ret_sblim=$?
+    iptables-save | grep -q -- "-A INPUT -p tcp -m tcp --dport 5989 -j ACCEPT"
+    ret_port=$?
+    test $ret_sblim == 0 -a $ret_port == 0
+    return $?
+}
+
+
 
 #
-# If called with a param from service file:
+# If called with a param from .service file:
 #
-$@
+case "$@" in
+    "start"|"stop"|"restart"|"reload"|"status")
+        return 0;
+        ;;
+
+    *)
+        $@
+        ;;
+esac

@@ -1,0 +1,16 @@
+---
+description: 'Covers a reboot cycle - initiate and back up'
+libs: ['../libs/common']
+searchpath: '../tcs'
+
+
+---
+filename: 'reboot_initiate.sh'
+timeout: 10
+
+---
+filename: 'reboot_completed.sh'
+# Rebooting takes a while
+timeout: 240
+
+---

@@ -1,0 +1,16 @@
+---
+description: 'Automated installation with additional (but without TUI) tests.'
+
+
+---
+# Where to look for testsets.
+# By default it's the dirname of this file
+searchpath: '../sets/'
+sets:
+  - 'after_auto_install.set'
+  - 'basic.set'
+  - 'reboot.set'
+  - 'services.set'
+  - 'python.set'
+  - 'after_testing.set'
+---

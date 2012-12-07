@@ -1,0 +1,11 @@
+---
+description: 'AI with {tbd_profile} on VMs'
+
+
+---
+description: 'A basic auto installation without any TUI testing'
+testsuite: 'ai_basic'
+profile: '{tbd_profile}'
+host: 'default-libvirt'
+additional_kargs: 'storage_init BOOTIF=link'
+---

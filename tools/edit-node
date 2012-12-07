@@ -29,7 +29,8 @@ import optparse
 import logging
 import rpm
 import glob
-
+from time import strftime as date
+from subprocess import PIPE, STDOUT
 from imgcreate.debug import *
 from imgcreate.errors import *
 from imgcreate.fs import *
@@ -37,6 +38,19 @@ from imgcreate.live import *
 from imgcreate.creator import *
 import imgcreate.kickstart as kickstart
 from imgcreate import read_kickstart
+from optparse import Option
+
+class MultipleOption(Option):
+    ACTIONS = Option.ACTIONS + ("extend",)
+    STORE_ACTIONS = Option.STORE_ACTIONS + ("extend",)
+    TYPED_ACTIONS = Option.TYPED_ACTIONS + ("extend",)
+    ALWAYS_TYPED_ACTIONS = Option.ALWAYS_TYPED_ACTIONS + ("extend",)
+
+    def take_action(self, action, dest, opt, value, values, parser):
+        if action == "extend":
+            values.ensure_value(dest, []).append(value)
+        else:
+            Option.take_action(self, action, dest, opt, value, values, parser)
 
 class ExistingSparseLoopbackDisk(SparseLoopbackDisk):
     """don't want to expand the disk"""
@@ -289,6 +303,137 @@ class LiveImageEditor(LiveImageCreator):
             imgmnt.cleanup()
 
 
+    def mount(self, base_on, cachedir = None):
+        """mount existing file system.
+
+        We have to override mount b/c we many not be creating an new install
+        root nor do we need to setup the file system, i.e., makedirs(/etc/,
+        /boot, ...), nor do we want to overwrite fstab, or create selinuxfs.
+
+        We also need to get some info about the image before we can mount it.
+
+        base_on --  the <LIVEIMG.src> a LiveOS.iso file or an attached LiveOS
+                    device, such as, /dev/live for a currently running image.
+
+        cachedir -- a directory in which to store a Yum cache;
+                    Not used in edit-liveos.
+
+        """
+
+        if not base_on:
+            raise CreatorError("No base LiveOS image specified.")
+
+        self.__ensure_builddir()
+
+        self._ImageCreator_instroot = self._ImageCreator__builddir + "/install_root"
+        self._LoopImageCreator__imagedir = self._ImageCreator__builddir + "/ex"
+        self._ImageCreator_outdir = self._ImageCreator__builddir + "/out"
+
+        makedirs(self._ImageCreator_instroot)
+        makedirs(self._LoopImageCreator__imagedir)
+        makedirs(self._ImageCreator_outdir)
+
+        LiveImageCreator._base_on(self, base_on)
+        self._LoopImageCreator__fstype = get_fsvalue(self._image, 'TYPE')
+        self._get_fslabel()
+
+        self.fslabel = self._LoopImageCreator__fslabel
+        if self._LoopImageCreator__image_size == None:
+            self._LoopImageCreator__image_size = os.stat(self._image)[stat.ST_SIZE]
+
+        self._LoopImageCreator__instloop = ExtDiskMount(
+                ExistingSparseLoopbackDisk(self._image,
+                                           self._LoopImageCreator__image_size),
+                self._ImageCreator_instroot,
+                self._fstype,
+                self._LoopImageCreator__blocksize,
+                self.fslabel,
+                self.tmpdir)
+        try:
+            self._LoopImageCreator__instloop.mount()
+        except MountError, e:
+            raise CreatorError("Failed to loopback mount '%s' : %s" %
+                               (self._image, e))
+
+        cachesrc = cachedir or (self._ImageCreator__builddir + "/yum-cache")
+        makedirs(cachesrc)
+
+        for (f, dest) in [("/sys", None), ("/proc", None),
+                          ("/dev/pts", None), ("/dev/shm", None),
+                          (cachesrc, "/var/cache/yum")]:
+            self._ImageCreator__bindmounts.append(BindChrootMount(f, self._instroot, dest))
+
+        self._do_bindmounts()
+        self.__copy_img_root(base_on)
+        self._brand(self._builder)
+
+    def _base_on(self, base_on):
+        """Clone the running LiveOS image as the basis for the new image."""
+
+        self.__fstype = 'ext4'
+        self.__image_size = 4096L * 1024 * 1024
+        self.__blocksize = 4096
+
+        self.__instloop = ExtDiskMount(SparseLoopbackDisk(self._image,
+                                                          self.__image_size),
+                                       self._instroot,
+                                       self.__fstype,
+                                       self.__blocksize,
+                                       self.fslabel,
+                                       self.tmpdir)
+        try:
+            self.__instloop.mount()
+        except MountError, e:
+            raise CreatorError("Failed to loopback mount '%s' : %s" %
+                               (self._image, e))
+
+        subprocess.call(['rsync', '-ptgorlHASx', '--specials', '--progress',
+                         '--include', '/*/',
+                         '--exclude', '/etc/mtab',
+                         '--exclude', '/etc/blkid/*',
+                         '--exclude', '/dev/*',
+                         '--exclude', '/proc/*',
+                         '--exclude', '/home/*',
+                         '--exclude', '/media/*',
+                         '--exclude', '/mnt/live',
+                         '--exclude', '/sys/*',
+                         '--exclude', '/tmp/*',
+                         '--exclude', '/.liveimg*',
+                         '--exclude', '/.autofsck',
+                         '/', self._instroot])
+        subprocess.call(['sync'])
+
+        self._ImageCreator__create_minimal_dev()
+
+        self.__instloop.cleanup()
+
+
+    def __copy_img_root(self, base_on):
+        """helper function to copy root content of the base LiveIMG to
+        ISOdir"""
+
+        ignore_list = ['ext3fs.img', 'squashfs.img', 'osmin.img', 'home.img',
+                       'overlay-*']
+
+        imgmnt = DiskMount(LoopbackDisk(base_on, 0), self._mkdtemp())
+
+        self._LiveImageCreatorBase__isodir = self._ImageCreator__builddir + "/iso"
+
+        try:
+            imgmnt.mount()
+        except MountError, e:
+            raise CreatorError("Failed to mount '%s' : %s" % (base_on, e))
+        else:
+            # include specified files or directories
+            #copy over everything but squashfs.img or ext3fs.img
+            shutil.copytree(imgmnt.mountdir,
+                            self._LiveImageCreatorBase__isodir,
+                            ignore=shutil.ignore_patterns(*ignore_list))
+            subprocess.call(['sync'])
+        finally:
+            imgmnt.cleanup()
+
+
     def _brand (self, _builder):
         """Adjust the image branding to show its variation from original
         source by builder and build date."""
@@ -343,6 +488,7 @@ class LiveImageEditor(LiveImageCreator):
         """Restore the boot configuration files for an iso image boot."""
 
         bootfolder = os.path.join(isodir, 'isolinux')
+        efifolder = os.path.join(isodir, 'EFI/BOOT')
         oldpath = os.path.join(isodir, 'syslinux')
         if os.path.exists(oldpath):
             os.rename(oldpath, bootfolder)
@@ -358,7 +504,7 @@ class LiveImageEditor(LiveImageCreator):
             args.append('-e')
             args.append('s/Welcome to .*/Welcome to ' + self._releasefile + '!/')
         args.append('-e')
-        args.append('s/root=[^ ]*/root=live:CDLABEL=' + self.name + '/')
+        args.append('s/root=[^ ]*/root=live:CDLABEL=' + self.name[:32] + '/')
         if self.ks:
             # bootloader --append "!opt-to-remove opt-to-add"
             for param in kickstart.get_kernel_args(self.ks,"").split():
@@ -375,11 +521,20 @@ class LiveImageEditor(LiveImageCreator):
                     args.append('-e')
                     args.append("/^  append/s/$/ %s/" % param)
         args.append(cfgf)
+        # update BOOTX64.conf
+        eficfgf = os.path.join(efifolder, 'BOOTX64.conf')
+        efiargs = ['/bin/sed', '-i']
+        efiargs.append('-e')
+        efiargs.append('s/root=[^ ]*/root=live:CDLABEL=' + self.name[:32] + '/')
+        efiargs.append(eficfgf)
         dev_null = os.open("/dev/null", os.O_WRONLY)
         try:
             subprocess.Popen(args,
-                             stdout = subprocess.PIPE,
-                             stderr = dev_null).communicate()[0]
+                             stdout=subprocess.PIPE,
+                             stderr=dev_null).communicate()[0]
+            subprocess.Popen(efiargs,
+                             stdout=subprocess.PIPE,
+                             stderr=dev_null).communicate()[0]
             return 0
 
         except IOError, e:
@@ -459,7 +614,7 @@ class LiveImageEditor(LiveImageCreator):
         for repo in kickstart.get_repos(self.ks):
             (name, baseurl, mirrorlist, proxy, inc, exc) = repo
             if baseurl.startswith("file://"):
-               baseurl=baseurl[7:]
+                baseurl=baseurl[7:]
             elif not baseurl.startswith("/"):
                 raise CreatorError("edit-node accepts only --baseurl pointing to a local folder with RPMs (not YUM repo)")
             if not baseurl.endswith("/"):
@@ -473,70 +628,642 @@ class LiveImageEditor(LiveImageCreator):
                     ts.addInstall(hdr,(hdr,pkg), "u")
         ts.run(self.simpleCallback().callback,'')
 
-    def _install_plugins(self,plugins,repo_url):
-        # create repo file from url
-        repo_template = """[plugin repo]
-name=plugin repo
-baseurl=%(repo_url)s
-enabled=1
-gpgcheck=0
-"""
-        repo_dict = {
-        "repo_url" : repo_url,
-    }
-
-        f = open(self._instroot + "/etc/yum.repos.d/plugin.repo","w")
-        f.write(repo_template % repo_dict)
+    def _print_version(self):
+        f = open("%s/etc/system-release" % self._instroot)
+        output = f.readline()
         f.close()
-        plugins = plugins.replace(","," ")
-        yum_cmd = "yum install -y %s" % plugins
-        try:
-            subprocess.call([yum_cmd], preexec_fn = self._chroot, shell=True)
-        except OSError, e:
-            raise CreatorError("Failed to install plugin %s, %s " % (plugins, e))
-        #finally:
-        #    os.remove(self._instroot + "/etc/yum.repos.d/plugin.repo")
+        return output
+
+    def _update_version(self, options):
+        ver = self._print_version().strip()
+        f = open("%s/etc/system-release" % self._instroot, "w")
+        status = "Edited"
+        if not options.gpgcheck:
+            status += ", Unsigned"
+        f.write("%s (%s)" % (ver, status))
+        f.close()
+        print "done"
+        return True
+
+    def _change_uid(self, options):
+        if "," in options.uidmod:
+            try:
+                user, new_uid = options.uidmod.split(",")
+            except:
+                print "Failed Parsing %s" % options.uidmod
+                return False
+            cmd = "id -u %s" % user
+            f = subprocess.Popen(cmd, shell=True, stdout=PIPE, stderr=STDOUT, \
+                                 preexec_fn = self._chroot)
+            old_uid, err = f.communicate()
+            cmd = "usermod -u %s %s" % (new_uid, user)
+            f = subprocess.Popen(cmd, shell=True, stdout=PIPE, stderr=STDOUT, preexec_fn = self._chroot)
+            output, err = f.communicate()
+            cmd = "find / -uid %s -exec chown %s {} \;" % (old_uid, new_uid)
+            f = subprocess.Popen(cmd, shell=True, stdout=PIPE, stderr=STDOUT, preexec_fn = self._chroot)
+            output, err = f.communicate()
+
+    def _change_gid(self, options):
+        if "," in options.gidmod:
+            try:
+                group, new_gid = options.gidmod.split(",")
+            except:
+                print "Failed Parsing %s" % options.gidmod
+                return False
+            cmd = "getent group %s | cut -d: -f3" % group
+            f = subprocess.Popen(cmd, shell=True, stdout=PIPE, stderr=STDOUT, \
+                                 preexec_fn = self._chroot)
+            old_gid, err = f.communicate()
+            cmd = "groupmod -g %s %s" % (new_gid, group)
+            f = subprocess.Popen(cmd, shell=True, stdout=PIPE, stderr=STDOUT, preexec_fn = self._chroot)
+            output, err = f.communicate()
+            cmd = "find / -gid %s -exec chgrp %s {} \;" % (old_gid.strip(), new_gid)
+            f = subprocess.Popen(cmd, shell=True, stdout=PIPE, stderr=STDOUT, preexec_fn = self._chroot)
+            output, err = f.communicate()
+
+    def _print_rpm_manifest(self):
+        cmd = "rpm -qa|sort"
+        f = subprocess.Popen(cmd, shell=True, stdout=PIPE, stderr=STDOUT, preexec_fn = self._chroot)
+        output, err = f.communicate()
+        print "%s" % output
+        return True
+
+    def _print_file_manifest(self):
+        cmd = "find /"
+        f = subprocess.Popen(cmd, shell=True, stdout=PIPE, stderr=STDOUT, preexec_fn = self._chroot)
+        output, err = f.communicate()
+        print "\n%s\n" % output
+        return True
+    def _list_plugins(self):
+        plugin_info_dir =  "%s/etc/ovirt-plugins.d" % self._instroot
+        if os.path.exists(plugin_info_dir):
+            print "\nInstalled Plugins:\n"
+            for p in os.listdir(plugin_info_dir):
+                print "%s\n" % p
+        return True
+
+    def _create_manifests(self, options):
+        timestamp = date("%Y-%m-%d_%H-%M-%S")
+        if options.plugin:
+            pkg = options.plugin
+        elif options.install_dup:
+            pkg = options.install_dup
+        elif options.install:
+            pkg = options.install
+        elif options.ssh_keys:
+            pkg = "ssh-key-edit"
+        elif options.uidmod:
+            pkg = "uid-mod"
+        elif options.gidmod:
+            pkg = "gid-mod"
+        print "Creating Manifests"
+        # Create post-image processing manifests
+        cmd = "LC_ALL=C rpm -qa --qf '%%{name}-%%{version}-%%{release}.%%{arch} (%%{SIGPGP:pgpsig})\n' | sort -u > /manifest-%s-%s-rpm.txt" % (timestamp, pkg)
+        f = subprocess.Popen(cmd, shell=True, stdout=PIPE, stderr=STDOUT, preexec_fn = self._chroot)
+        output, err = f.communicate()
+
+        cmd = "LC_ALL=C rpm -qa --qf '%%{name}-%%{version}-%%{release}.%%{arch} (%%{SIGPGP:pgpsig})\n' | sort -u > /manifest-%s-%s-rpm.txt" % (timestamp, pkg)
+        f = subprocess.Popen(cmd, shell=True, stdout=PIPE, stderr=STDOUT, preexec_fn = self._chroot)
+        output, err = f.communicate()
+
+        cmd = "LC_ALL=C rpm -qa --qf '%%{sourcerpm}\n' | sort -u > /manifest-%s-%s-srpm.txt" % (timestamp, pkg)
+        f = subprocess.Popen(cmd, shell=True, stdout=PIPE, stderr=STDOUT, preexec_fn = self._chroot)
+        output, err = f.communicate()
+
+        # collect all included licenses rhbz#601927
+        cmd = "LC_ALL=C rpm -qa --qf '%%{license}\n' | sort -u > /manifest-%s-%s-license.txt" % (timestamp, pkg)
+        f = subprocess.Popen(cmd, shell=True, stdout=PIPE, stderr=STDOUT, preexec_fn = self._chroot)
+        output, err = f.communicate()
+
+        cmd = "du -akx --exclude=/var/cache/yum / > /manifest-%s-%s-file.txt" % (timestamp, pkg)
+        f = subprocess.Popen(cmd, shell=True, stdout=PIPE, stderr=STDOUT, preexec_fn = self._chroot)
+        output, err = f.communicate()
+
+        cmd = "du -x --exclude=/var/cache/yum / > /manifest-%s-%s-dir.txt" % (timestamp, pkg)
+        f = subprocess.Popen(cmd, shell=True, stdout=PIPE, stderr=STDOUT, preexec_fn = self._chroot)
+        output, err = f.communicate()
+
+        # create plugin info
+        if options.install or options.plugin or options.install_dup:
+            plugin_info_dir =  "%s/etc/ovirt-plugins.d" % self._instroot
+            os.system("mkdir -p %s" % plugin_info_dir)
+            # get version-release
+            cmd = "rpm -q %s --qf '%%{version}-%%{release}.%%{arch}\n'" % pkg
+            f = subprocess.Popen(cmd, shell=True, stdout=PIPE, stderr=STDOUT, \
+                                 preexec_fn = self._chroot)
+            vr, err = f.communicate()
+            # get install date
+            cmd = "LC_ALL=C rpm -q %s --qf '%%{INSTALLTIME:date}\n'" % pkg
+            f = subprocess.Popen(cmd, shell=True, stdout=PIPE, stderr=STDOUT, \
+                                 preexec_fn = self._chroot)
+            install_date, err = f.communicate()
+            if os.path.isfile(pkg):
+                #get rpm name
+                cmd = "rpm -qp %s --qf '%%{name}'" % pkg
+                f = subprocess.Popen(cmd, shell=True, stdout=PIPE, stderr=STDOUT)
+                pkg, err = f.communicate()
+            plugin_file = "%s/%s" % (plugin_info_dir, pkg)
+            pfile = open(plugin_file, "w")
+            pfile.write("Name:%s\n" % pkg)
+            pfile.write("Version:%s-%s" % (pkg,vr))
+            pfile.write("Install Date:%s" % install_date)
+            pfile.close()
+
+        # create deltas
+        for i in ["file", "dir","owns", "deps" ]:
+            # if current-XXX-manifest exists run delta based on it
+            if os.path.exists("%s/iso/isolinux/current-manifest-%s.txt" % (self._ImageCreator__builddir, i)):
+                cmd = "cp %s/iso/isolinux/current-manifest-%s.txt > %s/manifest-%s.txt" % (self._ImageCreator__builddir, i, self._instroot ,i)
+                f = subprocess.Popen(cmd, shell=True, stdout=PIPE, stderr=STDOUT)
+                output, err = f.communicate()
+            else:
+                cmd =  "bzcat %s/iso/isolinux/manifest-%s.txt.bz2|sort > %s/manifest-%s.txt" % (self._ImageCreator__builddir, i, self._instroot ,i)
+                f = subprocess.Popen(cmd, shell=True, stdout=PIPE, stderr=STDOUT)
+                output, err = f.communicate()
+            cmd = "diff -u /manifest-%s.txt /manifest-%s-%s-%s.txt |egrep -v \"^@|^ \"> /delta-%s-manifest-%s-%s.txt" % (i, timestamp, pkg, i, timestamp, i, pkg)
+            f = subprocess.Popen(cmd, shell=True, stdout=PIPE, stderr=STDOUT, preexec_fn = self._chroot)
+            output, err = f.communicate()
+        for i in ["rpm", "srpm", "license"]:
+            if os.path.exists("%s/iso/isolinux/current-manifest-%s.txt" % (self._ImageCreator__builddir, i)):
+                cmd =  "cat %s/iso/isolinux/current-manifest-%s.txt|sort -u > %s/manifest-%s.txt" % (self._ImageCreator__builddir, i, self._instroot ,i)
+                f = subprocess.Popen(cmd, shell=True, stdout=PIPE, stderr=STDOUT)
+                output, err = f.communicate()
+            else:
+                cmd =  "cat %s/iso/isolinux/manifest-%s.txt|sort -u > %s/manifest-%s.txt" % (self._ImageCreator__builddir, i, self._instroot ,i)
+                f = subprocess.Popen(cmd, shell=True, stdout=PIPE, stderr=STDOUT)
+                output, err = f.communicate()
+            cmd = "diff -u /manifest-%s.txt /manifest-%s-%s-%s.txt |egrep -v \"^@|^ \" > /delta-%s-manifest-%s-%s.txt" % (i, timestamp, pkg, i, timestamp, i, pkg)
+            f = subprocess.Popen(cmd, shell=True, stdout=PIPE, stderr=STDOUT, preexec_fn = self._chroot)
+            output, err = f.communicate()
+        # cleanup copied manifests
+        for i in ["rpm", "srpm", "license", "file", "dir","owns", "deps"]:
+            cmd = "rm -rf %s/manifest-%s.txt" % (self._instroot ,i)
+            f = subprocess.Popen(cmd, shell=True, stdout=PIPE, stderr=STDOUT)
+            output, err = f.communicate()
+        print "Copying Manifests"
+        for file in glob.glob("%s/*manifest-*" % self._instroot):
+            rootfs_manifest_dir = "%s/etc/ovirt-plugins-manifests.d" % self._instroot
+            os.system("mkdir -p %s" % rootfs_manifest_dir)
+            cmd = "cp %s %s" % (file, rootfs_manifest_dir)
+            f = subprocess.Popen(cmd, shell=True, stdout=PIPE, stderr=STDOUT)
+            if f.returncode > 0:
+                output, err = f.communicate()
+                print output
+                print "Failed to copy %s to %s/manifests" % (file, plugin_info_dir)
+                return False
+            cmd = "mv %s %s/iso/isolinux" % (file, self._ImageCreator__builddir)
+            f = subprocess.Popen(cmd, shell=True, stdout=PIPE, stderr=STDOUT)
+            output, err = f.communicate()
+            if f.returncode > 0:
+                cmd = "ls -al %s" % self._ImageCreator__builddir
+                f = subprocess.Popen(cmd, shell=True, stdout=PIPE, stderr=STDOUT)
+                output, err = f.communicate()
+                print output
+                print "Failed to copy %s to %s/iso/isolinux" % (file,self._ImageCreator__builddir)
+                return False
+        # update symlink
+        for f in ["rpm", "srpm", "license", "file", "dir" ]:
+            if os.path.exists("%s/iso/isolinux/current-manifest-%s.txt" % (self._ImageCreator__builddir, f)):
+                os.system("rm -rf %s/iso/isolinux/current-manifest-%s.txt" % (self._ImageCreator__builddir, f))
+            cwd = os.getcwd()
+            os.chdir("%s/iso/isolinux" % self._ImageCreator__builddir)
+            src = "manifest-%s-%s-%s.txt" % (timestamp, pkg, f)
+            dest = "current-manifest-%s.txt" % f
+            os.symlink(src, dest)
+            os.chdir(cwd)
+
+    def _mount_iso(self, iso):
+        t = tempfile.mkdtemp(dir =  os.path.abspath(self.tmpdir),
+                             prefix = "edit-liveos-")
+        cmd = "mount -o loop %s %s" % (iso, t)
+        f = subprocess.Popen(cmd, shell=True, stdout=PIPE, stderr=STDOUT)
+        output, err = f.communicate()
+        if f.returncode > 0:
+            print output
+            return False
+        return t
+
+    def _get_manifests(self, iso):
+        isodir = self._mount_iso(iso)
+        timestamp = date("%Y-%m-%d_%H-%M-%S")
+        dirname = "manifests-%s" % timestamp
+        cmd = "mkdir /tmp/%s" % dirname
+        os.system(cmd)
+        for file in glob.glob("%s/isolinux/*manifest-*" % isodir):
+            cmd = "cp -a %s /tmp/%s" % (file, dirname)
+            f = subprocess.Popen(cmd, shell=True, stdout=PIPE, stderr=STDOUT)
+            output, err = f.communicate()
+        cmd = "tar cjvf %s.tar.bz2 %s"  % (dirname, dirname)
+        cwd = os.getcwd()
+        os.chdir("/tmp")
+        f = subprocess.Popen(cmd, shell=True, stdout=PIPE, stderr=STDOUT)
+        output, err = f.communicate()
+        if f.returncode > 0:
+            print output
+            return False
+        os.system("rm -rf /tmp/%s" % dirname)
+        cmd = "cp %s.tar.bz2 %s" % (dirname, cwd)
+        f = subprocess.Popen(cmd, shell=True, stdout=PIPE, stderr=STDOUT)
+        output, err = f.communicate()
+        print output
+        if not f.returncode > 0:
+            print "\nManifests are located in : %s/%s.tar.bz2" % (cwd,dirname)
+            os.system("umount %s" % isodir)
+            os.system("rm -rf %s" % isodir)
+        else:
+            return False
         return
 
+    def _print_manifest(self, iso, manifest):
+        isodir = self._mount_iso(iso)
+        m_path = "%s/isolinux/%s" % (isodir, manifest)
+        if os.path.exists(m_path):
+            cmd = "cat %s" % m_path
+            f = subprocess.Popen(cmd, shell=True, stdout=PIPE, stderr=STDOUT)
+            output, err = f.communicate()
+            print output
+        else:
+            print "\nInvalid Manifest Filename"
+        os.system("umount %s" % isodir)
+        os.system("rm -rf %s" % isodir)
+        return
+
+    def _print_manifests(self, iso):
+        isodir = self._mount_iso(iso)
+        li = os.listdir("%s/isolinux" % isodir)
+        li.sort()
+        print "\n"
+        for entry in li:
+            if os.path.islink("%s/isolinux/%s" % (isodir,entry)):
+                link = os.readlink("%s/isolinux/%s" % (isodir,entry))
+                if "manifest" in link:
+                    print "%s -> %s" % (entry, link)
+            else:
+                if "manifest" in entry:
+                    print entry
+        cmd = "umount %s" % isodir
+        f = subprocess.Popen(cmd, shell=True, stdout=PIPE, stderr=STDOUT)
+        output, err = f.communicate()
+        os.system("rm -rf %s" % isodir)
+        return
+
+    def _install_pkgs(self,options):
+        self._setup_dns()
+        if not self._setup_yum_repo(options):
+            return False
+        if not self._run_yum_install(options.install):
+            return False
+        else:
+            self._cleanup_editing()
+            return True
+
+    def _install_plugins(self,options):
+        self._setup_dns()
+        if not self._setup_yum_repo(options):
+            return False
+        if not self._run_yum_install(options.plugin):
+            self._cleanup_editing()
+            return False
+        else:
+            #validate files added
+            for rpm in options.plugin.split(","):
+                self._cleanup_editing()
+                if self._validate_installed_files(options, rpm):
+                    return True
+                else:
+                    return False
+
+            self._cleanup_editing()
+            return True
+        return True
+
+    class simpleCallback:
+        def __init__(self):
+            self.fdnos = {}
+
+        def callback(self, what, amount, total, mydata, wibble):
+            if what == rpm.RPMCALLBACK_TRANS_START:
+                pass
+
+            elif what == rpm.RPMCALLBACK_INST_OPEN_FILE:
+                hdr, path = mydata
+                print "Installing %s\r" % (hdr["name"])
+                fd = os.open(path, os.O_RDONLY)
+                nvr = '%s-%s-%s' % ( hdr['name'], hdr['version'], hdr['release'] )
+                self.fdnos[nvr] = fd
+                return fd
+
+            elif what == rpm.RPMCALLBACK_INST_CLOSE_FILE:
+                hdr, path = mydata
+                nvr = '%s-%s-%s' % ( hdr['name'], hdr['version'], hdr['release'] )
+                os.close(self.fdnos[nvr])
+
+            elif what == rpm.RPMCALLBACK_INST_PROGRESS:
+                hdr, path = mydata
+                print "%s:  %.5s%% done\r" % (hdr["name"], (float(amount) / total) * 100),
+
+    def install_rpms(self):
+        if kickstart.exclude_docs(self.ks):
+            rpm.addMacro("_excludedocs", "1")
+        if not kickstart.selinux_enabled(self.ks):
+            rpm.addMacro("__file_context_path", "%{nil}")
+        if kickstart.inst_langs(self.ks) != None:
+            rpm.addMacro("_install_langs", kickstart.inst_langs(self.ks))
+        # start RPM transaction
+        ts=rpm.TransactionSet(self._instroot)
+        for repo in kickstart.get_repos(self.ks):
+            (name, baseurl, mirrorlist, proxy, inc, exc) = repo
+            if baseurl.startswith("file://"):
+                baseurl=baseurl[7:]
+            elif not baseurl.startswith("/"):
+                raise CreatorError("edit-node accepts only --baseurl pointing to a local folder with RPMs (not YUM repo)")
+            if not baseurl.endswith("/"):
+                baseurl+="/"
+            for pkg_from_list in kickstart.get_packages(self.ks):
+                # TODO report if package listed in ks is missing
+                for pkg in glob.glob(baseurl+pkg_from_list+"-[0-9]*.rpm"):
+                    fdno = os.open(pkg, os.O_RDONLY)
+                    hdr = ts.hdrFromFdno(fdno)
+                    os.close(fdno)
+                    ts.addInstall(hdr,(hdr,pkg), "u")
+        ts.run(self.simpleCallback().callback,'')
+
+    def _setup_dns(self):
+        print "Setting Up DNS For Chroot"
+        # bind mount resolv.conf
+        os.system("touch %s/etc/resolv.conf" % self._instroot)
+        os.system("mount -o bind /etc/resolv.conf %s/etc/resolv.conf" % self._instroot)
+    def _setup_yum_repo(self, options):
+        print "Configuring Yum Repo"
+        self.dd_dir = tempfile.mkdtemp(dir =  os.path.abspath(self.tmpdir), prefix = "dd-iso")
+        if not options.repo:
+            return True
+        else:
+            if os.path.isfile(options.repo) and not options.repo.lower().endswith(".iso"):
+                cmd = "touch /etc/yum.repos.d/plugin.repo"
+                f = subprocess.Popen(cmd, shell=True, stdout=PIPE, stderr=STDOUT, preexec_fn = self._chroot)
+                output, err = f.communicate()
+                if f.returncode > 0:
+                    print output
+                    print "Can't Create Repo File"
+                    return False
+                cmd = "mount -o bind %s %s/etc/yum.repos.d/plugin.repo" % (options.repo,self._instroot)
+                f = subprocess.Popen(cmd, shell=True, stdout=PIPE, stderr=STDOUT)
+                output, err = f.communicate()
+                if f.returncode > 0:
+                    print "Can't Bind Mount Repo File"
+                    print output
+                    return False
+                return True
+            elif os.path.isdir(options.repo) or options.repo.lower().endswith(".iso"):
+                if options.repo.lower().endswith(".iso"):
+                    cmd = "mount -o loop %s %s" % (options.repo, self.dd_dir)
+                    f = subprocess.Popen(cmd, shell=True, stdout=PIPE, stderr=STDOUT)
+                    output, err = f.communicate()
+                    if f.returncode > 0:
+                        print cmd
+                        print output
+                        print "Can't Mount Driver Disk ISO"
+                        return False
+                    if os.path.exists("%s/rpms/x86_64" % self.dd_dir):
+                        options.repo = "%s/rpms/x86_64" % self.dd_dir
+                    else:
+                        print "Cant find rpm directory: %s/rpms/x86_64" % self.dd_dir
+                        return False
+                os.system("mkdir %s/tmp/yumrepo" % self._instroot)
+                cmd = "mount -o bind %s %s/tmp/yumrepo" % (options.repo, self._instroot)
+                f = subprocess.Popen(cmd, shell=True, stdout=PIPE, stderr=STDOUT)
+                output, err = f.communicate()
+                if f.returncode > 0:
+                    print cmd
+                    print output
+                    print "Can't Bind Mount Yum Repo"
+                    return False
+
+                # build repo file
+                gpgcheck = 1
+                if not options.gpgcheck:
+                    gpgcheck = 0
+                # create repo file from url
+                repo_template = """[plugin_repo]
+name=plugin repo
+gpgcheck=%(gpg_check)s
+baseurl=file:///tmp/yumrepo
+enabled=1
+ """
+                repo_dict = {
+               "gpg_check" : gpgcheck
+             }
+
+                f = open(self._instroot + "/etc/yum.repos.d/plugin.repo","w")
+                f.write(repo_template % repo_dict)
+                f.close()
+                return True
+            else:
+                print "Invalid Yum Repo Type"
+                return False
+
+    def _validate_installed_files(self, options, rpm):
+        _usr_loc = glob.glob("/usr/share/%s*" % rpm)
+        _doc_loc = glob.glob("/usr/share/doc/%s*" % rpm)
+        if options.plugin:
+            valid_write_locations = [ "/etc",
+                                      "/opt",
+                                      "/usr/share/man",
+                                      "/usr/lib/python"]
+        elif options.install_dup:
+            valid_write_locations = [ "/etc/modprobe.d",
+                                      "/etc/depmod.d",
+                                      "/usr/share",
+                                      "/lib/modules",
+                                      "/lib/firmware" ]
+        for entry in _usr_loc:
+            valid_write_locations.append(entry)
+        for entry in _doc_loc:
+            valid_write_locations.append(entry)
+        cmd = "rpm -ql %s" % rpm
+        f = subprocess.Popen(cmd, shell=True, stdout=PIPE, stderr=STDOUT, preexec_fn = self._chroot)
+        output, err = f.communicate()
+        output = output.splitlines()
+        i_files = []
+        for line in output:
+            if line.startswith("/"):
+                i = 0
+                for dir in valid_write_locations:
+                    # checking list against valid paths
+                    if not dir in line and i <= len(valid_write_locations):
+                        i = i + 1
+                        # check for last iteration
+                        if i == len(valid_write_locations):
+                            i_files.append(line)
+                    else:
+                        # file is valid
+                        break
+        print "Package Validation Completed For: %s" % rpm
+        if len(i_files) > 0:
+            print "Unable to install package due to directory restrictions on:\n"
+            for file in i_files:
+                print "%s" % file
+            return False
+        return True
+
+    def _minimize(self):
+        print "Running Minimizer"
+        minimizer = "/usr/bin/image-minimizer"
+        if os.path.exists(minimizer):
+            print glob.glob("%s/etc/ovirt-plugins.d/*.minimize" % self._instroot)
+            for f in glob.glob("%s/etc/ovirt-plugins.d/*.minimize" % self._instroot):
+                cmd = "%s -v -i %s %s" % (minimizer, self._instroot, f)
+                print cmd
+                minimize = subprocess.Popen(cmd, shell=True, stdout=PIPE, \
+                                stderr=STDOUT)
+                output, err = minimize.communicate()
+                print output
+
+    def _cleanup_editing(self):
+        print "Cleaning Up Yum Configuration"
+        os.system("umount %s/etc/resolv.conf" % self._instroot)
+        if os.path.exists(self._instroot + "/etc/yum.repos.d/plugin.repo"):
+            try:
+                os.remove(self._instroot + "/etc/yum.repos.d/plugin.repo")
+            except:
+                os.system("umount %s/etc/yum.repos.d/plugin.repo" % self._instroot)
+        if os.path.exists(self._instroot + "/tmp/yumrepo"):
+            # cleanup local repo if exists
+            if os.system("umount %s/tmp/yumrepo" % self._instroot):
+                os.system("rm -rf %s/tmp/yumrepo" % self._instroot)
+        return
+
+    def _run_yum_install(self, pkgs):
+        print "Running Yum Install"
+        if not os.path.exists("%s/usr/bin/yum" % self._instroot):
+            print "\nERROR: Yum Is Not Installed Within The ISO\n"
+            self._cleanup_editing()
+            return False
+        if os.path.isfile(pkgs):
+            os.system("mkdir %s/tmp/yumrepo" % self._instroot)
+            os.system("touch %s/tmp/yumrepo/%s" % (self._instroot,os.path.basename(pkgs)))
+            os.system("mount -o bind %s %s/tmp/yumrepo/%s" % (pkgs, self._instroot,os.path.basename(pkgs)))
+            print os.listdir("%s/tmp/yumrepo" % self._instroot)
+            yum_cmd = "yum localinstall -y /tmp/yumrepo/%s" % os.path.basename(pkgs)
+        else:
+            yum_cmd = "yum install -y %s " % pkgs
+        # make sure rpm keys are imported
+        rpm_cmd = "rpm --import /etc/pki/rpm-gpg/RPM-GPG-KEY*"
+        rpm = subprocess.Popen(rpm_cmd, shell=True, stdout=PIPE, \
+                                stderr=STDOUT, preexec_fn=self._chroot)
+        output, err = rpm.communicate()
+        yum = subprocess.Popen(yum_cmd, shell=True, stdout=PIPE, \
+                               stderr=STDOUT, preexec_fn=self._chroot)
+        output, err = yum.communicate()
+        print output
+        if yum.returncode > 0:
+            print "Yum Install Failed"
+            logging.error(output)
+            self._cleanup_editing()
+            return False
+        if "localinstall" in yum_cmd:
+            os.system("umount %s/tmp/yumrepo/%s" % (self._instroot,os.path.basename(pkgs)))
+            os.system("rm -rf %s/tmp/yumrepo" % self._instroot)
+        return True
+
+    def _install_dup(self, options):
+        self._setup_dns()
+        if self._setup_yum_repo(options):
+            if not self._run_yum_install(options.install_dup):
+                self._cleanup_editing()
+                return False
+            else:
+                #validate files added by dup
+                for rpm in options.install_dup.split(","):
+                    self._cleanup_editing()
+                    if self._validate_installed_files(options, rpm):
+                        return True
+                    else:
+                        return False
+        else:
+            return False
+
     def _set_password(self,options):
-        cmd = "/usr/sbin/usermod -p \"%s\" admin" % options.password
-        try:
-            print self._chroot
-            subprocess.call([cmd], preexec_fn = self._chroot, shell=True)
-        except OSError, e:
-            raise CreatorError("Failed to set password, %s " % e)
+        for key in options.password:
+            # if no users defined, default is admin
+            if "," in key:
+                user, password = key.split(",")
+            else:
+                user = "root"
+                password = key
+            cmd = "/usr/sbin/usermod -p \"%s\" %s" % (password, user)
+            print cmd
+            try:
+                print self._chroot
+                subprocess.call([cmd], preexec_fn = self._chroot, shell=True)
+            except OSError, e:
+                raise CreatorError("Failed to set password, %s " % e)
 
     def _setup_ssh_keys(self,options):
-        for key in options.ssh_keys.split(","):
+        for key in options.ssh_keys:
             # if no users defined, default is admin
-            if options.key_users is None:
-                options.key_users = "admin"
-            for user in options.key_users.split(","):
-                if user == "root":
-                    home = "/root/.ssh"
-                else:
-                    home = "/home/%s/.ssh" % user
-                if not os.path.exists(self._instroot + home):
-                    os.mkdir(self._instroot + home)
-                k = open(key).read()
+            if "," in key:
+                user, keyfile = key.split(",")
+            else:
+                user = "admin"
+                keyfile = key
+            if user == "root":
+                home = "/root/.ssh"
+            else:
+                home = "/home/%s/.ssh" % user
+            if not os.path.exists(self._instroot + home):
+                os.system("mkdir -p %s%s" % (self._instroot, home))
+                k = open(keyfile).read()
                 f = open(self._instroot + home + "/authorized_keys", "a")
                 f.write(k)
                 f.close()
 
+    def _rebuild_initramfs(self):
+        # ensure dmsquash-live dracut module is included
+        d_conf = "%s/etc/dracut.conf" % self._instroot
+        dracut_conf = open(d_conf, "a")
+        dracut_conf.write('add_dracutmodules+="dmsquash-live"')
+        dracut_conf.close()
+        cmd = "rpm -q kernel"
+        f = subprocess.Popen(cmd, shell=True, stdout=PIPE, stderr=STDOUT, preexec_fn = self._chroot)
+        output, err = f.communicate()
+        kver = output.strip().replace("kernel-","")
+        cmd = "new-kernel-pkg --package kernel --mkinitrd --dracut --depmod --update %s" % kver
+        f = subprocess.Popen(cmd, shell=True, stdout=PIPE, stderr=STDOUT, preexec_fn = self._chroot)
+        output, err = f.communicate()
+        if f.returncode > 0:
+            print output
+            print "Failed to generate new initramfs"
+            return False
+        else:
+            initramfs_file = glob.glob("%s/boot/initramfs*" % self._instroot)[0]
+            f = subprocess.Popen(cmd, shell=True, stdout=PIPE, stderr=STDOUT)
+            output, err = f.communicate()
+            cmd = "mv %s %s/isolinux/initrd0.img" % (initramfs_file, self._LiveImageCreatorBase__isodir)
+            f = subprocess.Popen(cmd, shell=True, stdout=PIPE, stderr=STDOUT)
+            output, err = f.communicate()
+            if f.returncode > 0:
+                print output
+                print "Failed to generate new initramfs"
+                return False
+
+
 def parse_options(args):
-    parser = optparse.OptionParser(usage = """
+    parser = optparse.OptionParser(option_class=MultipleOption, usage = """
        %prog [-n=<name>]
                       [-o <output>]
                       [-k <kickstart-file>]
                       [-s <script.sh>]
-                      [-w <encrypted password>
+                      [-w <user,encrypted password>
                       [-l <sshkeyfile>
-                      [-u <ssh_key_users>
                       [-t <tmpdir>]
                       [-r <releasefile>]
                       [-b <builder>]
-                      [-p <plugin>]
-                      [-r <plugin_repo>
+                      [--install-kmod <kmod_pkg_name>
+                      [--install-plugin <plugin_name>
+                      [--install <pkg_name>
+                      [--repo <plugin_repo>
                       <LIVEIMG.src>""")
 
     parser.add_option("-n", "--name", type="string", dest="name",
@@ -553,14 +1280,17 @@ def parse_options(args):
                       help="specify script to run chrooted in the LiveOS "
                            "fsimage")
 
-    parser.add_option("-w", "--passwd", type="string", dest="password",
-                      help="encrypted password")
+    parser.add_option("-w", "--passwd", action="extend", dest="password",
+                      help="comma delimited list of user and encrypted password")
 
-    parser.add_option("-l", "--sshkey", type="string", dest="ssh_keys",
+    parser.add_option("-l", "--sshkey", action="extend", dest="ssh_keys",
                       help="comma delimited list of ssh public key files")
 
-    parser.add_option("-u", "--key_users", type="string", dest="key_users",
-                      help="comma delimited list of user account for ssh public key files")
+    parser.add_option("--uidmod", type="string", dest="uidmod",
+                      help="Change a user uid number and correct filesystem")
+
+    parser.add_option("--gidmod", type="string", dest="gidmod",
+                      help="Change a group id number and correct filesystem")
 
     parser.add_option("-t", "--tmpdir", type="string",
                       dest="tmpdir", default="/var/tmp",
@@ -576,8 +1306,35 @@ def parse_options(args):
     parser.add_option("-p", "--install-plugin", type="string",
                       dest="plugin", help="Specify plugins to install")
 
-    parser.add_option("", "--repo", type="string",
-                      dest="repo", help="Specify repo to install plugin from")
+    parser.add_option("--install", type="string",
+                      dest="install", help="Specify packages to install")
+
+    parser.add_option("--install-kmod", type="string",
+                      dest="install_dup", help="Specify driver update packages to install")
+
+    parser.add_option("--repo", type="string",
+                      dest="repo", help="Specify yum repo file or yum repository on the filesystem")
+    parser.add_option("--nogpgcheck", action="store_false", default=True,
+                      dest="gpgcheck", help="Allow unsigned packages to be installed")
+
+    m_grp = optparse.OptionGroup(parser, ("Manifest Options"))
+    m_grp.add_option("", "--list-plugins", action="store_true", default=False,
+                     dest="listplugins", help="List Installed Plugins")
+    m_grp.add_option("", "--print-version", action="store_true", default=False,
+                     dest="printversion", help="Print Current Version of ISO")
+    m_grp.add_option("", "--print-manifests", action="store_true", default=False,
+                     dest="printmanifests", help="Print a list of manifests files within the iso")
+    m_grp.add_option("", "--print-manifest", type="string", default="",
+                     dest="printmanifest", help="Print manifest file to stdout")
+    m_grp.add_option("", "--get-manifests", action="store_true", default=False,
+                     dest="getmanifests", help="Creates a tar file of manifests files within the iso")
+    m_grp.add_option("", "--print-file-manifest", action="store_true", default=False,
+                     dest="filemanifest", help="Prints contents of rootfs on iso to stdout")
+    m_grp.add_option("", "--print-rpm-manifest", action="store_true", default=False,
+                     dest="rpmmanifest", help="Prints installed rpms within rootfs on iso to stdout")
+
+    parser.add_option_group(m_grp)
+
 
     setup_logging(parser)
 
@@ -607,22 +1364,23 @@ def get_fsvalue(filesystem, tag):
 def rebuild_iso_symlinks(isodir):
     # remove duplicate files and rebuild symlinks to reduce iso size
     efi_vmlinuz = "%s/EFI/BOOT/vmlinuz0" % isodir
-    isolinux_vmlinuz = "%s/isolinux/vmlinuz0" % isodir
     efi_initrd = "%s/EFI/BOOT/initrd0.img" % isodir
-    isolinux_initrd = "%s/isolinux/initrd0.img" % isodir
 
     if os.path.exists(efi_vmlinuz):
         os.remove(efi_vmlinuz)
         os.remove(efi_initrd)
-        os.symlink(isolinux_vmlinuz,efi_vmlinuz)
-        os.symlink(isolinux_initrd,efi_initrd)
+        # build relative symlinks instead of absolute
+        cwd = os.getcwd()
+        os.chdir("%s/EFI/BOOT" % isodir)
+        os.system("ln -s ../../isolinux/vmlinuz0 .")
+        os.system("ln -s ../../isolinux/initrd0.img .")
+        os.chdir(cwd)
 
 def main():
     # LiveOS set to <LIVEIMG.src>
     (LiveOS, options) = parse_options(sys.argv[1:])
-
     if os.geteuid () != 0:
-        print >> sys.stderr, "You must run edit-liveos as root"
+        print >> sys.stderr, "You must run edit-node as root"
         return 1
 
     if options.name:
@@ -643,42 +1401,105 @@ def main():
     editor.tmpdir = options.tmpdir
     editor._builder = options.builder
     editor._releasefile = options.releasefile
-
     try:
+        rebuild = 1
+        mount = True
+        p = ""
+        if options.install:
+            p = options.install
+        elif options.install_dup:
+            p = options.install_dup
+        elif options.plugin:
+            p = options.plugin
         if options.kscfg:
             editor.ks = read_kickstart(options.kscfg)
             # part / --size <new rootfs size to be resized to>
             editor._LoopImageCreator__image_size = kickstart.get_image_size(editor.ks)
-        if options.script:
-            if not os.path.exists(options.script):
-                print "Invalid Script Path '%s'" % options.script
-                return 1
-        for key in options.ssh_keys.split(","):
-            if not os.path.exists(key):
-                print "Invalid Script Path '%s'" % key
-                return 1
-        editor.mount(LiveOS, cachedir = None)
-        editor._configure_bootloader(editor._LiveImageCreatorBase__isodir)
-        if editor.ks:
-            editor._run_pre_scripts()
-            editor.install_rpms()
-            editor._run_post_scripts()
-        if options.script:
-            print "Running edit script '%s'" % options.script
-            editor._run_script(options.script)
-        if options.plugin:
-            print "Installing Plugins"
-            editor._install_plugins(options.plugin,options.repo)
-        if not options.password is None:
-            print "Setting Admin Password"
-            editor._set_password(options)
-        if not options.ssh_keys is None:
-            editor._setup_ssh_keys(options)
-        print "Editing Complete"
-        rebuild_iso_symlinks(editor._LiveImageCreatorBase__isodir)
-        editor.unmount()
-        editor.package(output)
-        logging.info("%s.iso saved to %s"  % (editor.name, output))
+        if options.ssh_keys:
+            for key in options.ssh_keys:
+                if "," in key:
+                    user, keyfile = key.split(",")
+                else:
+                    keyfile = key
+                if not os.path.exists(keyfile):
+                    print "\nInvalid Key Path: %s" % os.path.abspath(keyfile)
+                    return False
+        if options.getmanifests:
+            editor._get_manifests(LiveOS)
+            mount = False
+        elif len(options.printmanifest) > 0:
+            editor._print_manifest(LiveOS, options.printmanifest)
+            mount = False
+        elif options.printmanifests:
+            editor._print_manifests(LiveOS)
+            mount = False
+        elif options.repo is None and len(p) < 0:
+            print "An Editing Option Must Be Specified"
+            return False
+        # only mount rootfs as required since it's not necesary for all operations
+        elif mount:
+            editor.mount(LiveOS, cachedir = None)
+            if options.printversion:
+                ver = editor._print_version()
+                print "\n%s\n" % ver
+                rebuild = 0
+            if options.filemanifest:
+                editor._print_file_manifest()
+                rebuild = 0
+            if options.rpmmanifest:
+                editor._print_rpm_manifest()
+                rebuild = 0
+            if options.listplugins:
+                editor._list_plugins()
+                rebuild = 0
+            if editor.ks:
+                editor._run_pre_scripts()
+                editor.install_rpms()
+                editor._run_post_scripts()
+            if options.script:
+                print "Running edit script '%s'" % options.script
+                editor._run_script(options.script)
+            if options.install:
+                print "Installing Packages"
+                if not editor._install_pkgs(options):
+                    logging.error("Error Installing Requested Package(s) : %s" % options.install)
+                    return 1
+            elif options.plugin:
+                print "Installing Plugins"
+                if not editor._install_plugins(options):
+                    logging.error("Error Installing Plugin(s) : %s" % options.plugin)
+                    return 1
+            elif options.install_dup:
+                print "Installing DUP"
+                if not editor._install_dup(options):
+                    editor.unmount()
+                    logging.error("Error Installing Drive Update Package : %s" % options.install_dup)
+                    return 1
+            if not options.password is None:
+                print "Setting Account Passwords"
+                editor._set_password(options)
+            if not options.ssh_keys is None:
+                editor._setup_ssh_keys(options)
+            if not options.uidmod is None:
+                editor._change_uid(options)
+            if not options.gidmod is None:
+                editor._change_gid(options)
+            if rebuild == 1:
+                editor._update_version(options)
+                editor._minimize()
+                editor._create_manifests(options)
+                print "Editing Complete"
+                editor._configure_bootloader(editor._LiveImageCreatorBase__isodir)
+                rebuild_iso_symlinks(editor._LiveImageCreatorBase__isodir)
+                editor._rebuild_initramfs()
+                editor.unmount()
+                editor.package(output)
+                logging.info("%s.iso saved to %s"  % (editor.name, output))
+            else:
+                # in manifest mode print do necessary items
+                editor.unmount()
+
+            logging.info("%s.iso saved to %s"  % (editor.name, output))
     except CreatorError, e:
         logging.error(u"Error editing LiveOS : %s" % e)
         return 1

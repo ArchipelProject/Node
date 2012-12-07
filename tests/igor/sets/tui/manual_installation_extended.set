@@ -1,0 +1,40 @@
+---
+description: 'A extended TUI installation, one testcase per page'
+libs: ['../../libs/common', '../../libs/uinput']
+searchpath: '../../tcs/uinput/installer'
+
+
+---
+filename: '../../wait_for_installer_welcome_page.sh'
+timeout: 70
+
+---
+filename: '01_welcome_page.py'
+
+---
+filename: '02_keyboard_page.py'
+
+---
+filename: '03_boot_device_page.py'
+
+---
+filename: '04_installation_device_page.py'
+
+---
+filename: '05_sizes_page.py'
+
+---
+filename: '06_password_page.py'
+
+---
+filename: '07_progress_page.py'
+# Timeout for installation
+timeout: 120
+
+---
+# Ends with a reboot
+filename: '../../reboot_completed.sh'
+# Timeout for reboot
+timeout: 70
+
+---

@@ -3,7 +3,6 @@ keeprpm system-config-keyboard-base
 droprpm libsemanage-python
 
 droprpm mkinitrd
-droprpm isomd5sum
 droprpm checkpolicy
 droprpm make
 droprpm setools-libs-python
@@ -11,7 +10,6 @@ droprpm setools-libs
 
 droprpm gamin
 droprpm pm-utils
-droprpm kbd
 droprpm usermode
 droprpm vbetool
 droprpm ConsoleKit
@@ -36,15 +34,10 @@ droprpm febootstrap
 # cronie pulls in exim (sendmail) which pulls in all kinds of perl deps
 droprpm exim
 droprpm perl*
-# keep libperl for snmpd
-keeprpm perl-libs
 droprpm postfix
 droprpm mysql*
 
 droprpm sysklogd
-
-# unneeded rhn deps
-droprpm yum*
 
 # pam complains when this is missing
 keeprpm ConsoleKit-libs
@@ -66,6 +59,7 @@ keep /lib/modules/*/kernel/fs/fscache
 keep /lib/modules/*/kernel/fs/lockd
 keep /lib/modules/*/kernel/fs/nls/nls_utf8.ko
 keep /lib/modules/*/kernel/fs/configfs/configfs.ko
+keep /lib/modules/*/kernel/fs/fuse
 # autofs4     configfs  exportfs *fat     *jbd    mbcache.ko  nls       xfs
 #*btrfs       cramfs   *ext2     *fscache *jbd2  *nfs         squashfs
 # cachefiles  dlm      *ext3      fuse     jffs2 *nfs_common  ubifs
@@ -76,12 +70,14 @@ drop /lib/modules/*/kernel/net
 keep /lib/modules/*/kernel/net/802*
 keep /lib/modules/*/kernel/net/bridge
 keep /lib/modules/*/kernel/net/core
+keep /lib/modules/*/kernel/net/dns_resolver
 keep /lib/modules/*/kernel/net/ipv*
 keep /lib/modules/*/kernel/net/key
 keep /lib/modules/*/kernel/net/llc
 keep /lib/modules/*/kernel/net/netfilter
 keep /lib/modules/*/kernel/net/rds
 keep /lib/modules/*/kernel/net/sctp
+keep /lib/modules/*/kernel/net/sched
 keep /lib/modules/*/kernel/net/sunrpc
 #*802    atm        can   ieee802154 *key      *netfilter  rfkill *sunrpc  xfrm
 #*8021q  bluetooth *core *ipv4       *llc       phonet     sched   wimax
@@ -102,6 +98,7 @@ keep /lib/modules/*/kernel/drivers/edac
 keep /lib/modules/*/kernel/drivers/firmware
 keep /lib/modules/*/kernel/drivers/idle
 keep /lib/modules/*/kernel/drivers/infiniband
+keep /lib/modules/*/kernel/drivers/input/misc/uinput.ko
 keep /lib/modules/*/kernel/drivers/md
 keep /lib/modules/*/kernel/drivers/message
 keep /lib/modules/*/kernel/drivers/net
@@ -118,8 +115,10 @@ drop /lib/modules/*/kernel/drivers/usb/class
 drop /lib/modules/*/kernel/drivers/usb/image
 drop /lib/modules/*/kernel/drivers/usb/misc
 drop /lib/modules/*/kernel/drivers/usb/serial
+keep /lib/modules/*/kernel/drivers/usb/storage
 keep /lib/modules/*/kernel/drivers/vhost
 keep /lib/modules/*/kernel/drivers/virtio
+keep /lib/modules/*/kernel/drivers/watchdog
 
 # acpi       *cpufreq   hid         leds      mtd      ?regulator  uwb
 #*ata         crypto   ?hwmon      *md       *net*      rtc       *vhost
@@ -142,8 +141,6 @@ drop /usr/share/backgrounds
 drop /usr/share/wallpapers
 drop /usr/share/kde-settings
 drop /usr/share/gnome-background-properties
-drop /usr/share/dracut
-drop /usr/share/plymouth
 drop /usr/share/setuptool
 drop /usr/share/hwdata/MonitorsDB
 drop /usr/share/hwdata/oui.txt
@@ -200,6 +197,7 @@ keep /usr/share/augeas/lenses/dist/shellvars_list.aug
 keep /usr/share/augeas/lenses/dist/sshd.aug
 keep /usr/share/augeas/lenses/dist/sudoers.aug
 keep /usr/share/augeas/lenses/dist/utill.aug
+keep /usr/share/augeas/lenses/dist/yum.aug
 drop /usr/share/tc
 drop /usr/share/emacs
 drop /usr/share/info
@@ -260,8 +258,9 @@ drop /usr/share/X11
 drop /usr/share/i18n
 drop /boot/*
 keep /boot/efi
+keep /boot/System.map*
+keep /boot/symvers*
 drop /var/lib/builder
-drop /var/lib/yum
 drop /usr/sbin/rhn_register
 drop /usr/sbin/*-channel
 
@@ -301,16 +300,7 @@ drop /etc/pki/tls
 keep /etc/pki/tls/openssl.cnf
 drop /etc/pki/java
 drop /etc/pki/nssdb
-drop /etc/pki/rpm-gpg
 
-# minimize net-snmp
-drop /etc/rc.d/init.d/snmptrapd
-drop /etc/snmp/snmptrapd.conf
-drop /etc/sysconfig/snmptrapd
-drop /usr/sbin/snmptrapd
-drop /usr/bin/net-snmp-create-v3-user
-drop /usr/bin/snmpconf
-drop /usr/share/snmp/snmpconf-data
 
 #desktop files
 drop /etc/xdg/autostart/restorecond.desktop
@@ -322,6 +312,8 @@ drop /sbin/ebtables-restore
 # remove bogus kdump script (rpmdiff complains)
 drop /etc/kdump-adv-conf
 
+# drop net-snmp
+droprpm net-snmp
 #cim
 droprpm tog-pegasus
 droprpm tog-pegasus-libs
@@ -331,13 +323,10 @@ droprpm openslp
 #remove rpms added by dmraid
 droprpm ConsoleKit
 droprpm checkpolicy
-droprpm dmraid
 droprpm dmraid-events
 droprpm gamin
 droprpm gnupg2
 droprpm hdparm
-droprpm isomd5sum
-droprpm kbd
 droprpm libicu
 droprpm libsemanage-python
 droprpm linux-atm-libs
@@ -359,3 +348,14 @@ droprpm sgpio
 droprpm syslinux
 droprpm system-config-firewall-base
 droprpm usermode
+
+#NFS Server
+droprpm rpcbind
+drop /usr/sbin/rpc.idmapd
+drop /usr/bin/rpcgen
+drop /usr/sbin/rpc.gssd
+drop /usr/sbin/rpc.idmapd
+drop /usr/sbin/rpc.mountd
+drop /usr/sbin/rpc.nfsd
+drop /usr/sbin/rpc.svcgssd
+drop /usr/sbin/rpcdebug

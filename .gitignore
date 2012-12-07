@@ -22,3 +22,5 @@ recipe/version.ks
 scripts/collectd.conf
 *.iso
 *manifest
+py-compile
+scripts/ovirt-functions

@@ -26,15 +26,18 @@ from ovirtnode.install import *
 from ovirtnode.network import *
 from ovirtnode.log import *
 from ovirtnode.kdump import *
-from ovirtnode.snmp import *
+
 
 def config_networking():
    # network configuration
     print "Configuring Network"
     if OVIRT_VARS["OVIRT_BOOTIF"] != "":
         network_auto()
-    if OVIRT_VARS.has_key("OVIRT_HOSTNAME"):
+    if "OVIRT_HOSTNAME" in OVIRT_VARS:
+        augtool("set", "/files/etc/sysconfig/network/HOSTNAME", \
+                OVIRT_VARS["OVIRT_HOSTNAME"])
         system("hostname %s" % OVIRT_VARS["OVIRT_HOSTNAME"])
+        ovirt_store_config("/etc/sysconfig/network")
 
 # setup network before storage for iscsi installs
 if is_iscsi_install():
@@ -45,7 +48,8 @@ if not is_stateless():
 
     if storage_auto():
         print "Completed automatic disk partitioning"
-        # store /etc/shadow if adminpw/rootpw are set, handled already in ovirt-early
+        # store /etc/shadow if adminpw/rootpw are set,
+        # handled already in ovirt-early
         file = open("/proc/cmdline")
         args = file.read()
         if "adminpw" in args or "rootpw" in args:
@@ -54,18 +58,23 @@ if not is_stateless():
             ovirt_store_config("/etc/shadow")
         file.close()
     else:
-        config_networking()
-        print "Automatic installation failed. Please review /tmp/ovirt.log"
+        if not is_iscsi_install():
+            config_networking()
+        print "Automatic installation failed. Please review /var/log/ovirt.log"
         sys.exit(1)
 
-config_networking()
+if not is_iscsi_install():
+    config_networking()
 #set ssh_passwd_auth
-if OVIRT_VARS.has_key("OVIRT_SSH_PWAUTH"):
+if "OVIRT_SSH_PWAUTH" in OVIRT_VARS:
     if OVIRT_VARS["OVIRT_SSH_PWAUTH"] == "yes":
-        augtool("set","/files/etc/ssh/sshd_config/PasswordAuthentication", "yes")
+        augtool("set", "/files/etc/ssh/sshd_config/PasswordAuthentication", \
+                "yes")
     elif OVIRT_VARS["OVIRT_SSH_PWAUTH"] == "no":
-        augtool("set","/files/etc/ssh/sshd_config/PasswordAuthentication", "no")
-    os.system("service sshd restart &> /dev/null")
+        augtool("set", "/files/etc/ssh/sshd_config/PasswordAuthentication", \
+                "no")
+    ovirt_store_config("/etc/ssh/sshd_config")
+    system_closefds("service sshd restart &> /dev/null")
 
 # iscsi handled in install.py
 print "Configuring Logging"
@@ -79,8 +88,13 @@ except:
 install = Install()
 print "Configuring KDump"
 kdump_auto()
-print "Configuring SNMP"
-snmp_auto()
+try:
+    from ovirt_config_setup.rhn import *
+    print "Configuring RHN"
+    rhn_auto()
+except:
+    pass
+
 if not is_stateless():
     print "Installing Bootloader"
     if install.ovirt_boot_setup():

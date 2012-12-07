@@ -1,0 +1,42 @@
+#!/bin/bash
+#
+# ovirt-early Start early ovirt services
+#
+# chkconfig: 23 01 99
+#
+### BEGIN INIT INFO
+# Provides: ovirt-early
+# Default-Start: 2 3 4 5
+# Dewscription: Managed node early configuration service
+### END INIT INFO
+
+# Source functions library
+. /usr/libexec/ovirt-init-functions.sh
+
+prog=ovirt-early
+
+case "$1" in
+    start)
+        echo -n "Starting ovirt-early: "
+        start_ovirt_early
+        test $? == 0 && success || failure
+        echo
+        ;;
+    status)
+        status -l $prog
+        ;;
+    reload)
+        reload_ovirt_early
+        ;;
+    stop)
+        echo -n "Stopping ovirt-early: "
+        stop_ovirt_early
+        test $? == 0 && success || failure
+        echo
+        ;;
+    *)
+        echo "Usage: ovirt-early {start}"
+        RETVAL=2
+esac
+
+exit $RETVAL

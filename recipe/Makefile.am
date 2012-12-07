@@ -29,10 +29,11 @@ ARCH              = $(shell rpm --eval '%{_arch}')
 NODE_CREATOR      = $(shell test -e node-creator && echo "./node-creator" || echo "/usr/sbin/node-creator")
 
 FEDORA_MIRROR     = http://mirrors.fedoraproject.org/mirrorlist
-OVIRT_URL	  = http://ovirt.org/releases/stable/fedora
-OVIRT_NIGHTLY_URL = http://ovirt.org/releases/nightly/fedora
-CUR_RAWHIDE       = 18
-CUR_DEVEL         = 17
+OVIRT_URL	      = http://ovirt.org/releases/stable/rpm/Fedora
+OVIRT_NIGHTLY_URL = http://ovirt.org/releases/nightly/rpm/Fedora
+OVIRT_BETA_URL    = http://ovirt.org/releases/beta/rpm/Fedora
+CUR_RAWHIDE       = 19
+CUR_DEVEL         = 18
 
 CENTOS_MIRROR     = http://mirrorlist.centos.org/
 CENTOS_RELEASE    = 6
@@ -57,7 +58,8 @@ EXTRA_DIST =                    \
         common-manifest.ks \
         image-minimizer.ks.in   \
         $(PACKAGE).ks.in        \
-        $(PACKAGE).ks
+        $(PACKAGE).ks           \
+        node-creator.8
 
 # For Release: 0..., set _ovirt_dev=1 so that we get extra_release.GIT-
 # annotated rpm version strings.
@@ -69,9 +71,10 @@ git_head	= $$(git log -1 --pretty=format:%h)
 GIT_RELEASE	= git$(git_head)
 EXTRA_RELEASE = $(if $(_ovirt_dev),.$(GIT_RELEASE),${nil})
 BUILD_NUMBER := .1
-RELEASE := $(shell rpm -q --qf "%{RELEASE}\n" --define "extra_release $(EXTRA_RELEASE)" --define "BUILD_NUMBER $(BUILD_NUMBER)" --specfile ../ovirt-node.spec | head -n1)
+RELEASE := $(shell rpm -q --qf "%{RELEASE}\n" $(if $(EXTRA_RELEASE), --define "extra_release $(EXTRA_RELEASE)") --define "BUILD_NUMBER $(BUILD_NUMBER)" --specfile ../ovirt-node.spec | head -n1)
 
 dist_sbin_SCRIPTS = node-creator
+man_MANS = node-creator.8
 
 $(PACKAGE).ks: repos.ks version.ks
 
@@ -87,6 +90,7 @@ repos.ks:
       elif [ -n "$(FEDORA)" ]; then \
             OVIRT_STABLE_REPO_LINE="repo --name=ovirt-stable-repo --baseurl=$(OVIRT_URL)/$(FEDORA)\n" ;\
             OVIRT_NIGHTLY_REPO_LINE="repo --name=ovirt-nightly-repo --baseurl=$(OVIRT_NIGHTLY_URL)/$(FEDORA)\n" ;\
+            OVIRT_BETA_REPO_LINE="repo --name=ovirt-beta-repo --baseurl=$(OVIRT_BETA_URL)/$(FEDORA)\n" ;\
             if [ 0$(FEDORA) == 0$(CUR_RAWHIDE) ]; then \
                 FEDORA_REPO=rawhide ;\
                 FEDORA_REPO_LOC="$(if $(FEDORA_URL),--baseurl=$(FEDORA_URL)/development/rawhide/$(ARCH)/os,--mirrorlist=$(FEDORA_MIRROR)?repo=rawhide&arch=$(ARCH))" ;\
@@ -104,6 +108,9 @@ repos.ks:
             printf "$${OVIRT_STABLE_REPO_LINE}" >> repos.ks ;\
             if [ "$${BUILD_TYPE}" == "NIGHTLY" ]; then \
               printf "$${OVIRT_NIGHTLY_REPO_LINE}" >> repos.ks ;\
+              printf "$${OVIRT_BETA_REPO_LINE}" >> repos.ks ;\
+            elif [ "$${BUILD_TYPE}" == "BETA" ]; then \
+              printf "$${OVIRT_BETA_REPO_LINE}" >> repos.ks ;\
             fi ;\
       else \
             echo "# OVIRT_REPO_URL=$(OVIRT_REPO_URL)" > $@ ;\
@@ -124,6 +131,7 @@ version.ks:
 	) > $@
 
 $(PACKAGE).$(PKG_FMT) node: version.ks repos.ks
+	rm -f $(PACKAGE_NAME).iso
 	$(NODE_CREATOR) $(RECIPE)
 	mv $(PACKAGE_NAME).iso $(PACKAGE_NAME)-$(VERSION)-$(RELEASE).iso
 	ln -snf $(PACKAGE_NAME)-$(VERSION)-$(RELEASE).iso $(PACKAGE_NAME).iso

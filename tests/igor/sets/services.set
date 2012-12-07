@@ -1,0 +1,14 @@
+---
+description: 'Does some checks on services'
+libs: ['libs/common']
+searchpath: '../tcs'
+
+
+---
+# First wait for boot process to finish
+filename: 'wait_for_getty.sh'
+
+---
+filename: 'services_are_running.sh'
+
+---

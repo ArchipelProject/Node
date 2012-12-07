@@ -1,0 +1,13 @@
+---
+description: 'Collect logs after all testing has been done (for debugging e.g.)'
+libs: ['../libs/common']
+searchpath: '../tcs'
+
+
+---
+filename: 'check_dmesg.sh'
+
+---
+filename: 'collect_logs.sh'
+
+---

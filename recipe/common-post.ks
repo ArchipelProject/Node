@@ -22,6 +22,8 @@ passwd -l root
 semanage  boolean -m -S targeted -F /dev/stdin  << \EOF_semanage
 allow_execstack=0
 virt_use_nfs=1
+virt_use_sanlock=1
+sanlock_use_nfs=1
 EOF_semanage
 
 # make sure we don't autostart virbr0 on libvirtd startup
@@ -42,10 +44,21 @@ cat >> /root/.bashrc << \EOF_bashrc
 # aliases used for the temporary
 function mod_vi() {
   /bin/vi $@
-  restorecon -v $@
+  restorecon -v $@ >/dev/null 2>&1
 }
-alias vi="mod_vi"
+
+function mod_yum() {
+  if [ "$1" == "--force" ]; then
+      echo $@ > /dev/null
+      shift
+      /usr/bin/yum $@
+  else
+      printf "\nUsing yum is not supported\n\n"
+  fi
+}
+
 alias ping='ping -c 3'
+alias yum="mod_yum"
 export MALLOC_CHECK_=1
 export LVM_SUPPRESS_FD_WARNINGS=0
 EOF_bashrc
@@ -100,6 +113,8 @@ empty	/live
 files	/boot
 empty	/boot-kdump
 empty	/cgroup
+files	/var/lib/yum
+files	/var/cache/yum
 EOF_rwtab_ovirt
 
 # fix iSCSI/LVM startup issue
@@ -119,7 +134,6 @@ set /files/etc/sysconfig/kdump/MKDUMPRD_ARGS --allow-missing
 save
 EOF_kdump
 
-echo 'OPTIONS="-v -Lf /dev/null"' >> /etc/sysconfig/snmpd
 cat > /etc/snmp/snmpd.conf << \EOF_snmpd
 master agentx
 dontLogTCPWrappersConnects yes
@@ -209,6 +223,10 @@ mkdir -p /root/.virt-manager /home/admin/.virt-manager
 #symlink virt-manager-tui pointer file to .pyc version
 sed -i "s/tui.py/tui.pyc/g" /usr/bin/virt-manager-tui
 
+#symlink ovirt-config-setup into $PATH
+ln -s /usr/libexec/ovirt-config-setup /usr/sbin/setup
+
+
 #set NETWORKING off by default
 augtool << \EOF_NETWORKING
 set /files/etc/sysconfig/network/NETWORKING no
@@ -224,14 +242,21 @@ set /files/etc/ssh/sshd_config/ClientAliveCountMax 0
 save
 EOF_sshd_config
 
-
-#Disable LRO for all nics that use it as a default
-#rhbz#772319
-echo "options bnx2x disable_tpa=1" > /etc/modprobe.d/bnx2x.conf
-echo "options mlx4_en num_lro=0" > /etc/modprobe.d/mlx4_en.conf
-echo "options s2io lro=0" > /etc/modprobe.d/s2io.conf
-
 #CIM related changes
 # set read-only
 echo "readonly = true;" > /etc/libvirt-cim.conf
-useradd -G sfcb cim
+groupadd cim
+useradd -g cim -G sfcb -s /sbin/nologin cim
+
+# disable yum repos by default
+augtool << \EOF_yum
+set /files/etc/yum.repos.d/fedora.repo/fedora/enabled 0
+set /files/etc/yum.repos.d/fedora-updates.repo/updates/enabled 0
+save
+EOF_yum
+
+#cleanup tmp directory from cim setup
+rm -rf /tmp/cim_schema*
+
+# enable strong random number generation
+sed -i '/SSH_USE_STRONG_RNG/d' /etc/sysconfig/sshd

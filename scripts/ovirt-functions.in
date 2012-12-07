@@ -1,0 +1,1235 @@
+# -*-Shell-script-*-
+
+OVIRT_LOGFILE=/var/log/ovirt.log
+OVIRT_TMP_LOGFILE=/tmp/ovirt.log
+touch $OVIRT_TMP_LOGFILE
+chcon -t var_log_t $OVIRT_TMP_LOGFILE
+_log_status=1
+
+# label of the oVirt partition
+OVIRT_LABEL=OVIRT
+# configuration values are loaded in the following order:
+# 1. /etc/sysconfig/node-config sets the default values
+# 2. /etc/default/ovirt is loaded to override defaults with karg values
+NODE_SYSCONFIG=/etc/sysconfig/node-config
+OVIRT_DEFAULTS=/etc/default/ovirt
+
+if [ -f "$NODE_SYSCONFIG" ]; then . "$NODE_SYSCONFIG"; fi
+if [ -f $OVIRT_DEFAULTS ];   then . $OVIRT_DEFAULTS; fi
+
+# fallback when default is empty
+OVIRT_STANDALONE=${OVIRT_STANDALONE:-0}
+
+OVIRT_BACKUP_DIR=/var/lib/ovirt-backup
+
+MANAGEMENT_SCRIPTS_DIR=/etc/node.d
+
+OVIRT_CONFIG_FILES="\
+ /etc/rsyslog.conf                              \
+ /etc/libvirt/libvirtd.conf                     \
+ /etc/libvirt/passwd.db                         \
+ /etc/passwd                                    \
+ /etc/shadow                                    \
+ /etc/ssh/ssh_host*_key*                        \
+ /etc/default/ovirt                             \
+ /etc/sysconfig/network                         \
+ /etc/collectd.conf                             \
+ /etc/libvirt/qemu/networks                     \
+ /etc/pki                                       \
+ /etc/logrotate.d/ovirt-node
+"
+
+. @DRACUTDIR@/91ovirtnode/ovirt-boot-functions
+LF=$'\n'
+SEP=','
+TAB=$'\t'
+
+# Save stdout to fd 6 and stderr to fd 7.  Redirect normal stdout/stderr
+# to log file
+start_log() {
+    if [ "$_log_status" = 1 ]; then
+        exec 6>&1
+        exec 7>&2
+        exec 8>>$OVIRT_TMP_LOGFILE
+        exec 1>&8
+        exec 2>&8
+        _log_status=0
+    fi
+}
+
+# Restore stdout/stderr from fd 6 and 7, respectively.  Close fd 6 and 7
+stop_log() {
+    if [ "$_log_status" != 1 ]; then
+        exec 1>&6 6>&-
+        exec 2>&7 7>&-
+        exec 8>&-
+        _log_status=1
+    fi
+}
+
+log() {
+    printf "$(date +'%b %d %H:%M:%S') "
+
+    if [ "$_log_status" = 1 ]; then
+        echo "$@"
+    else
+        echo "$@" >&6
+    fi
+}
+
+log_error() {
+    if [ "$_log_status" = 1 ]; then
+        echo "$@" >&2
+    else
+        printf "%s " "$(date +'%b %d %H:%M:%S')" "$@"
+        echo "$@" >&7
+    fi
+}
+
+ovirt_store_firstboot_config() {
+    # persist config for standalone
+    ovirt_store_config $OVIRT_CONFIG_FILES
+}
+
+# return 1 if oVirt Node is running in standalone mode
+# return 0 if oVirt Node is managed by the oVirt Server
+is_managed() {
+    return $OVIRT_STANDALONE
+}
+
+# oVirt Node in standalone mode does not try to contact the oVirt Server
+is_standalone() {
+    if is_managed; then return 1; else return 0; fi
+}
+
+# return 1 if cim is running
+# return 0 if cim is not running
+is_cim_enabled() {
+    if [ -z "$OVIRT_CIM_ENABLED" -o "$OVIRT_CIM_ENABLED" = "0" ]; then
+        return 1
+    else
+        return 0
+    fi
+}
+
+# return 1 if oVirt Node is running in stateless mode
+# return 0 if oVirt Node is not running in stateless mode
+is_stateless() {
+    if [ -z "$OVIRT_STATELESS" -o "$OVIRT_STATELESS" = "0" ]; then
+        return 1
+    else
+        return 0
+    fi
+}
+
+# return 0 if local storage is configured
+# return 1 if local storage is not configured
+is_local_storage_configured () {
+    if lvs HostVG/Config >/dev/null >&1; then
+        return 0
+    fi
+
+    return 1
+}
+
+# perform automatic local disk installation
+# when at least following boot parameters are present:
+# for networking - OVIRT_BOOTIF, management NIC
+#       if other ip bootparams are not specified, IPv4 DHCP is assumed
+# for storage - OVIRT_INIT, local disk to use
+#       if ovirt_vol is not specified, default volume sizes are set
+is_auto_install() {
+    if [ -n "$OVIRT_BOOTIF" ]; then
+        if [ -n "$OVIRT_INIT" ] ; then
+            return 0
+        elif egrep -q "storage_init|ovirt_init" /proc/cmdline ; then
+            return 2
+        else
+            return 1
+        fi
+    else
+        return 1
+    fi
+}
+
+# return 0 if this is an upgrade
+# return 1 otherwise
+is_upgrade() {
+    if [ "$OVIRT_UPGRADE" = "1" ]; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+# return 0 if booted from local disk
+# return 1 if booted from other media
+is_booted_from_local_disk() {
+    grep -q LABEL=Root /proc/cmdline
+}
+
+# was firstboot menu already shown?
+# state is stored in persistent config partition
+is_firstboot() {
+    if [ -z "$OVIRT_FIRSTBOOT" -o "$OVIRT_FIRSTBOOT" = "1" ]; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+# is install option passed?
+is_install() {
+    if [ -z "$OVIRT_INSTALL" -o "$OVIRT_INSTALL" = "0" ]; then
+        return 1
+    else
+        return 0
+    fi
+}
+
+disable_firstboot() {
+    if mount_config; then
+        augtool <<EOF
+set /files$OVIRT_DEFAULTS/OVIRT_FIRSTBOOT 0
+set /files$OVIRT_DEFAULTS/OVIRT_INIT '""'
+set /files$OVIRT_DEFAULTS/OVIRT_UPGRADE 0
+EOF
+    fi
+}
+
+# Destroys a particular volume group and its logical volumes.
+#
+wipe_volume_group()
+{
+    vg="$1"
+    local pv_dev=$2
+
+    for d in $(grep $vg /proc/mounts|awk '{print $2}'|sort -r); do
+        log "Unmounting $d"
+        umount $d
+    done
+    for d in $(grep $vg /proc/swaps|awk '{print $1}'); do
+        log "Turning off $d"
+        swapoff "$d"
+    done
+    log "Removing $vg"
+    if [ -z "$pv_dev" ]; then
+        LVM2_VG_NAME=""
+        LVM2_PV_NAME=""
+        pv_filter=""
+        pv_list=""
+        oldIFS="$IFS"
+        LF=$'\n'
+        IFS="$LF"
+        for vars in $(pvs --nameprefixes --noheadings -o pv_name,vg_name); do
+            eval  $vars
+            if [ "$LVM2_VG_NAME" = "HostVG" ]; then
+                if [ -n "${pv_list}" ]; then
+                    pv_list="${pv_list}${LF}${LVM2_PV_NAME}"
+                    #pv_filter="${pv_filter}, \"a|^${LVM2_PV_NAME}\$|\""
+                else
+                    pv_list="${LVM2_PV_NAME}"
+                    #pv_filter="${LVM2_PV_NAME}"
+                fi
+            fi
+        done
+        yes | vgremove -f $vg
+        for pv in $pv_list; do
+            yes | pvremove -ff "$pv"
+        done
+        IFS="$oldIFS"
+    else
+        # XXX isn't filter is useless w/o "r|.*|" ?
+        yes | vgremove -f $vg --config " devices { filter = [ \"a|$pv_dev|\" ] } "
+        yes | pvremove -ff "$pv_dev" --config " devices { filter = [ \"a|$pv_dev|\" ] } "
+    fi
+}
+
+# find_srv SERVICE PROTO
+#
+# reads DNS SRV record
+# sets SRV_HOST and SRV_PORT if DNS SRV record found, clears them if not
+# Example usage:
+# find_srv ovirt tcp
+# if [ -n "$SRV_HOST" -a -n "$SRV_PORT" ]; then
+#   echo "oVirt Server found"
+# else
+#   echo "no oVirt Server available, running standalone"
+# fi
+find_srv()
+{
+    local dnsreply
+    local domain=$(dnsdomainname 2>/dev/null)
+    if [ "$domain" = "localdomain" ]; then
+        domain=""
+    fi
+    # FIXME dig +search does not seem to work with -t srv
+    # dnsreply=$(dig +short +search -t srv _$1._$2)
+    # This is workaround:
+    local search=$(grep search /etc/resolv.conf)
+    search=${search#search }
+    for d in $domain $search; do
+        dnsreply=$(dig +short -t srv _$1._$2.$d)
+        rc=$?
+        if [ $rc -eq 0 ]; then
+            set _ $dnsreply; shift
+            SRV_HOST=$4; SRV_PORT=$3
+            return 0
+        fi
+    done
+    SRV_HOST=; SRV_PORT=
+    return 1
+}
+
+die()
+{
+    echo "$@" 1>&2; failure; echo 1>&2; exit 1
+}
+
+ovirt_setup_libvirtd() {
+    # just to get a boot warning to shut up
+    touch /etc/resolv.conf
+
+    # make libvirtd listen on the external interfaces
+    sed -i -e 's/^#\(LIBVIRTD_ARGS="--listen"\).*/\1/' \
+       /etc/sysconfig/libvirtd
+
+    # set up qemu daemon to allow outside VNC connections
+    sed -i -e 's/^[[:space:]]*#[[:space:]]*\(vnc_listen = "0.0.0.0"\).*/\1/' \
+       /etc/libvirt/qemu.conf
+    # set up libvirtd to listen on TCP (for kerberos)
+    sed -i -e "s/^[[:space:]]*#[[:space:]]*\(listen_tcp\)\>.*/\1 = 1/" \
+       -e "s/^[[:space:]]*#[[:space:]]*\(listen_tls\)\>.*/\1 = 0/" \
+       /etc/libvirt/libvirtd.conf
+}
+
+ovirt_setup_anyterm() {
+   # configure anyterm
+   cat >> /etc/sysconfig/anyterm << EOF
+ANYTERM_CMD="sudo /usr/bin/virsh console %p"
+ANYTERM_LOCAL_ONLY=false
+EOF
+
+   # permit it to run the virsh console
+   echo "anyterm ALL=NOPASSWD: /usr/bin/virsh console *" >> /etc/sudoers
+}
+
+md5() {
+  md5sum $1 2>/dev/null | (read MD5 filename; echo $MD5)
+}
+
+# return uppercase value
+uc() {
+    echo $(echo $1|tr '[[:lower:]]' '[[:upper:]]')
+}
+
+# return indirect value
+# non-bashism for ${!var}
+ptr() {
+    local v=$1
+    eval "v=\$$v"
+    echo $v
+}
+
+# mount livecd media
+# e.g. CD /dev/sr0, USB /dev/sda1,
+# PXE /dev/loop0 (loopback ISO)
+# not available when booted from local disk installation
+mount_live() {
+    if grep -q " /live " /etc/mtab; then
+        return 0
+    fi
+    local live_dev=/dev/live
+    if [ ! -e $live_dev ]; then
+        if losetup /dev/loop0|grep -q '\.iso'; then
+            # PXE boot
+            live_dev=/dev/loop0
+        else
+            return 1
+        fi
+    fi
+    mkdir -p /live
+    mount -r $live_dev /live || mount $live_dev /live
+}
+
+# mount root partition
+# boot loader + kernel + initrd + LiveOS
+mount_liveos() {
+    if grep -q " /liveos " /etc/mtab; then
+        return 0
+    fi
+    mkdir -p /liveos
+    mount LABEL=Root /liveos || mount -r LABEL=Root /liveos
+}
+
+mount_iscsi_liveos() {
+    if grep -q " /liveos " /etc/mtab; then
+        return 0
+    fi
+    mount LABEL=ovirt-node-root /liveos || mount -r LABEL=ovirt-node-root /liveos
+}
+# mount config partition
+# /config for persistance
+mount_config() {
+    # Only try to mount /config if the persistent storage exists
+    if [ -e /dev/HostVG/Config ] ; then
+        mkdir -p /config
+        if ! grep -q " /config ext[234] " /proc/mounts; then
+            mount /dev/HostVG/Config /config || return 1
+        fi
+
+        # optional config embedded in the livecd image
+        if [ -e /live/config ]; then
+            cp -rv --update /live/config/* /config
+        fi
+        # bind mount all persisted configs to rootfs
+        for f in $(cat /config/files); do
+            if grep -q " $f ext[234]" /proc/mounts ; then
+                # skip if already bind-mounted
+                true
+            else
+                mkdir -p "$(dirname "$f")"
+                touch "$f"
+                mount -n --bind "/config/$f" "$f"
+            fi
+        done
+
+        return 0
+    else
+        # /config is not available
+        return 1
+    fi
+}
+
+mount_boot() {
+
+    if grep -q " /boot " /etc/mtab; then
+       return 0
+    fi
+    mkdir -p /boot
+    mount LABEL=Boot /boot
+}
+# stop any service which keeps /var/log busy
+# keep the list of services
+unmount_logging_services() {
+    # mapping command->service is lame, but works for most initscripts
+    services=
+    cd /etc/init.d
+    # fixup for vdsm-reg intscript
+    if ! grep  "processname: vdsm-reg-setup" /etc/init.d/vdsm-reg; then
+        echo "# processname: vdsm-reg-setup" >> /etc/init.d/vdsm-reg
+    fi
+    for prg in $(lsof -Fc +D /var/log|grep ^c|sort -u); do
+        prog=${prg#c}
+        srv=$(grep -l "processname: .*$prog"$ *)
+        if [ -z "$srv" ]; then
+            # for scripts without chkconfig init header
+            srv=$(grep -l '^prog=["]*'$prog'["]*$' *)
+        fi
+        if [ -z "$srv" ]; then
+            # fallback for scripts without correct prog=
+            srv=$(grep -l '^DAEMON=["]*'$prog'["]*$' *)
+        fi
+        if [ -z "$srv" ]; then
+            # fallback for scripts with more than 1 daemon
+            srv=$(grep -l "daemon $prog$" *)
+        fi
+        if [ -n "$srv" ]; then
+            service $srv stop 6>&- 7>&-
+            services="$services $srv"
+        else
+            # failed to map process to initscript
+            killall "$prog"
+        fi
+    done
+    # debugging help
+    lsof +D /var/log
+    # unmount all under /var/log/
+    for d in $(grep /var/log/ /proc/mounts|awk '{print $2}'); do
+        log "Unmounting $d"
+        umount $d
+    done
+}
+
+# mount logging partition
+# this only gets executed when disk is re-partitioned, HostVG/Logging is empty
+mount_logging() {
+    if grep -q " /var/log ext[234]" /proc/mounts; then
+        return 0
+    fi
+
+    if [ -e /dev/HostVG/Logging ] ; then
+        log "Mounting log partition"
+
+        # temporary mount-point
+        log2=$(mktemp -d)
+        mkdir -p $log2
+        mount /dev/HostVG/Logging $log2
+        unmount_logging_services
+        # save logs from tmpfs
+        cp -av /var/log/* $log2
+        # save temporary log
+        if [ -e /tmp/ovirt.log ]; then
+            {
+                echo 'BEGIN of temporary log' ;
+                cat /tmp/ovirt.log ;
+                echo 'END of temporary log' ;
+            } &>> $log2/ovirt.log
+        fi
+        mount --move $log2 /var/log
+        rmdir $log2
+        restorecon -rv /var/log
+        for srv in $services; do
+            service $srv start 6>&- 7>&-
+        done
+
+        return 0
+    else
+        # /var/log is not available
+        printf "\nThe logging partion has not been created. Please create it at the main menu.\n"
+        return 1
+    fi
+}
+
+unmount_logging() {
+    if ! grep -q " /var/log ext[234]" /proc/mounts; then
+        return 0
+    fi
+
+    log "Unmounting log partition"
+    # plymouthd keeps /var/log/boot.log
+    if plymouth --ping ; then
+        plymouth --quit
+    fi
+    unmount_logging_services
+
+    umount /var/log
+    rc=$?
+    if [ $rc -ne 0 ]; then
+        return $rc
+    fi
+    for srv in $services; do
+        service $srv start 6>&- 7>&-
+    done
+
+    return 0
+}
+
+# mount data partition
+mount_data() {
+    udevadm settle
+    if [ -e /dev/HostVG/Data ] ; then
+        mkdir -p /data
+        if ! grep -q " /data ext[234]" /proc/mounts; then
+            mount /data
+        fi
+
+        mkdir -p /data/images
+        mkdir -p /data/images/rhev
+        chown 36:36 /data/images/rhev
+        mkdir -p /var/lib/libvirt/images
+        if ! grep -q "/var/lib/libvirt/images ext[234]" /proc/mounts; then
+            mount /var/lib/libvirt/images
+        fi
+        restorecon -rv /var/lib/libvirt/images
+
+        mkdir -p /data/core
+        mkdir -p /var/log/core
+        if ! grep -q "/var/log/core ext[234]" /proc/mounts; then
+            mount /var/log/core
+        fi
+        restorecon -rv /var/log/core
+        chmod 1777 /var/log/core
+        # configure kdump
+        cat > /etc/kdump.conf <<\EOF
+default reboot
+ext4 /dev/HostVG/Data
+path /core
+EOF
+        ovirt_store_config /etc/kdump.conf
+        service kdump restart
+        return 0
+    else
+        # /data is not available
+        printf "\nThe data partition has not been created. Create a Data partition with the \"Configure storage partitions\" menu.\n"
+        return 1
+    fi
+}
+
+mount_data2() {
+    if grep -q " /data2 ext3" /proc/mounts; then
+        return 0
+    fi
+
+    if [ -e /dev/AppVG/Data2 ] ; then
+        mkdir -p /data2
+        mount /data2
+
+        return 0
+    else
+        # /data2 is not available
+        printf "\nThe data2 partion has not been created. Please create it at the main menu.\n"
+        return 1
+    fi
+}
+
+mount_crypt_swap() {
+    crypttab="/etc/ovirt-crypttab"
+    if [ ! -s "${crypttab}" ]; then
+        return 1
+    fi
+    rc=0
+
+    while read label dev mapp cyph; do
+        if [ -n ${label} -a -n ${dev} -a -n ${mapp} -a -n ${cyph} ]; then
+            if grep -q "${dev}" /proc/swaps; then
+                swapoff ${dev} >/dev/null 2>&1
+                rc=$?
+                [ ${rc} -ne 0 ] && {
+                    log "swapoff failed for Un-encrypted ${dev}";
+                    continue;
+                }
+            fi
+            if [ ! -b ${mapp} ]; then
+                /sbin/cryptsetup -d /dev/urandom -c ${cyph} create $(basename ${mapp}) ${dev} > /dev/null 2>&1
+                rc=$?
+                [ ${rc} -ne 0 ] && {
+                    log "Creation of encrypted swap for ${dev} failed";
+                    continue;
+                }
+            fi
+            mkswap -L ${label} ${mapp} >/dev/null 2>&1
+            rc=$?
+            [ ${rc} -ne 0 ] && {
+                log "Creation of swap for ${mapp} failed";
+                continue;
+            }
+            swapon ${mapp} > /dev/null 2>&1
+            [ ${rc} -ne 0 ] && {
+                log "Activation of swap for ${mapp} failed";
+                continue;
+            }
+        else
+            continue
+        fi
+    done < ${crypttab}
+
+    return ${rc}
+}
+
+# augtool wrapper
+#   workaround for bind-mounted files
+#   see https://fedorahosted.org/augeas/ticket/32
+# augtool [tmpaugscript]
+# script MUST NOT include save, it is added by the wrapper
+# with copy_if_rename_fails flag set
+# 'tmpaugscript' is removed after successfull execution
+# without a parameter, augtool commands are expected on standard input
+augtool() {
+    local tmpaug=$1
+    if [ -z "$1" ]; then
+        # read from stdin
+        tmpaug=$(mktemp)
+        cat > $tmpaug
+    fi
+    cat >> $tmpaug <<EOF
+clear /augeas/save/copy_if_rename_fails
+save
+EOF
+    /usr/bin/augtool < $tmpaug > /dev/null
+    rc=$?
+    if [ $rc -eq 0 ]; then
+        rm $tmpaug
+    fi
+    return $rc
+}
+
+# persist configuration to /config
+#   ovirt_store_config /etc/config /etc/config2 ...
+#   copy to /config and bind-mount back
+ovirt_store_config() {
+    rc=0
+    if is_stateless; then
+        # no need to do anything
+        return 0;
+    fi
+    if grep -q " /config ext[234]" /proc/mounts; then
+        for p in "$@"; do
+            local filename=$(readlink -f $p)
+            local persist_it=true
+            if [[ "$filename" =~ ^/[^/]*$ ]]; then
+                # persisting top-level folder makes trouble rhbz#611617
+                printf "Cannot persist system folder: ${filename}\n"
+                persist_it=false
+            elif [ -d $filename ]; then
+                if [ -d /config$filename ]; then
+                    printf "Directory already persisted: ${filename}\n"
+                    printf "You need to unpersist its child directories and/or files and try again.\n"
+                    persist_it=false
+                fi
+            elif [ -f $filename ]; then
+                if [ -f /config$filename ]; then
+                    local md5root=$(md5 $filename)
+                    local md5stored=$(md5 /config$filename)
+                    if [ "$md5root" = "$md5stored" ]; then
+                        printf "File already persisted: ${filename}\n"
+                        persist_it=false
+                    else
+                        # persistent copy needs refresh
+                        umount -n $filename 2> /dev/null || :
+                        rm -f /config$filename
+                    fi
+                fi
+            else
+                printf "Cannot persist: ${filename}\n"
+                persist_it=false
+            fi
+
+            if $persist_it; then
+                # skip if file does not exist
+                if [ ! -e "${filename}" ]; then
+                    printf " Skipping, file '${filename}' does not exist\n"
+                    continue
+                fi
+                # skip if already bind-mounted
+                if ! grep -q " $filename ext[234]" /proc/mounts ; then
+                    mkdir -p /config$(dirname $filename)
+                    cp -a $filename /config$filename \
+                        && mount -n --bind /config$filename $filename
+                    if [ $? -ne 0 ]; then
+                        printf " Failed to persist\n"
+                        rc=1
+                    else
+                        printf " File persisted\n"
+                    fi
+                fi
+                # register in /config/files used by rc.sysinit
+                if ! grep -q "^${filename}$" /config/files 2> /dev/null ; then
+                    printf "${filename}\n" >> /config/files
+                fi
+                printf "\nSuccessfully persisted ${filename}\n"
+            fi
+        done
+        echo
+    else
+        printf "WARNING: persistent config storage not available\n"
+        rc=2
+    fi
+    return $rc
+}
+
+# check if stored config exists
+#       is_persisted /etc/config
+is_persisted() {
+    local abspath=$(readlink -e "$1")
+    test -f "/config$abspath"
+}
+
+# unmount bindmounted config files
+#       unmount_config /etc/config /etc/config2 ...
+#
+# Use before running commands which fail on bindmounted files.
+# After the file is replaced, call ovirt_store_config /etc/config ...
+# to bindmount the config file again.
+#
+unmount_config() {
+    if grep -q " /config ext[234]" /proc/mounts; then
+        for p in "$@"; do
+            f=$(readlink -f $p)
+            if grep -q " $f ext[234]" /proc/mounts ; then
+                if umount -n $f; then
+                    if [ -f /config$f ]; then
+                        # refresh the file in rootfs if it was mounted over
+                        cp -a /config$f $f
+                    fi
+                fi
+            fi
+        done
+    fi
+}
+
+# remove persistent config files
+#       remove_config /etc/config /etc/config2 ...
+#
+remove_config() {
+    #if stateless, then no need to go any further
+    if is_stateless; then
+        return 0
+    fi
+    # if there are no persisted files then just exit
+    if [ ! -s /config/files ]; then
+        printf "There are currently no persisted files.\n"
+        exit 1
+    fi
+
+    if grep -q " /config ext[234]" /proc/mounts; then
+        for p in "$@"; do
+            local filename=$(readlink -f $p)
+            if grep "^${filename}\$" /config/files > /dev/null 2>&1; then
+                if grep -q " $filename ext[234]" /proc/mounts ; then
+                    if umount -n $filename; then
+                        if [ -d $filename ]; then
+                            cp -ar /config/$filename/* $filename
+                            if [ $? -ne 0 ]; then
+                                printf " Failed to unpersist ${filename}\n"
+                                exit 1
+                            else
+                                printf " ${filename} successully unpersisted\n"
+                            fi
+                        else
+                            if [ -f /config$filename ]; then
+                                # refresh the file in rootfs if it was mounted over
+                                cp -a /config$filename $filename
+                                if [ $? -ne 0 ]; then
+                                    printf " Failed to unpersist ${filename}\n"
+                                    exit 1
+                                else
+                                    printf " ${filename} successully unpersisted\n"
+                                fi
+                            fi
+                        fi
+                    fi
+                else
+                    printf "$filename is not a persisted file.\n"
+                fi
+                # unregister in /config/files used by rc.sysinit
+                sed --copy -i "\|^${filename}$|d" /config/files
+            else
+                printf "File not explicitly persisted: ${filename}\n"
+            fi
+            # clean up the persistent store
+            rm -Rf /config$filename
+        done
+    fi
+}
+
+# ovirt_safe_delete_config
+#       ovirt_safe_delete_config /etc/config /etc/config2 ...
+#
+# Use to *permanently* remove persisted configuration file.
+# WARNING: file is shredded and removed
+#
+ovirt_safe_delete_config() {
+    local target
+
+    for target in "$@"; do
+        if grep -q " $target ext[234]" /proc/mounts; then
+            umount -n $target
+        fi
+
+        sed --copy -i "\|$target$|d" /config/files
+
+        if [ -d $target ]; then
+            for child in $(ls -d $target/*); do
+                ovirt_safe_delete_config $child
+            done
+            rm -rf /config$target
+            rm -rf $target
+        else
+            shred -u /config$target
+            shred -u $target
+        fi
+    done
+}
+
+
+backup_file() {
+    dir=$(dirname "$1")
+    case $dir in /*);; *) die "unexpected non-absolute dir: $dir";; esac
+    mkdir -p "$OVIRT_BACKUP_DIR/${dir:1}"
+    test -f "$1" && cp -pf "$1" "$OVIRT_BACKUP_DIR/${dir:1}"
+}
+
+add_if_not_exist() {
+    string="$1"
+    file="$2"
+
+    grep -qE "^[[:space:]]*$string($|#|[[:space:]])" "$file" \
+        || echo "$string" >> "$file"
+}
+
+# $1 - the string to be trimmed
+trim_whitespace () {
+    local text=${1}
+
+    printf "$text" | awk '{gsub(/^[ ]*/,"",$0); gsub(/[ ]*$/,"",$0) ; print }'
+}
+
+is_numeric() {
+    printf "$1" | grep -q -E '^[0-9]+$'
+}
+
+# LVM2 tools wrapper
+# to avoid warnings like:
+# File descriptor 6 (pipe:[20637]) leaked on lvrename invocation.
+# File descriptor 7 (pipe:[20637]) leaked on lvrename invocation.
+lvrename() {
+    /sbin/lvrename "$@" 6>&- 7>&-
+}
+
+pvs() {
+    /sbin/pvs "$@" 6>&- 7>&-
+}
+
+pvcreate() {
+    /sbin/pvcreate "$@" 6>&- 7>&-
+}
+
+pvremove() {
+    /sbin/pvremove "$@" 6>&- 7>&-
+}
+
+vgcreate() {
+    /sbin/vgcreate "$@" 6>&- 7>&-
+}
+
+vgremove() {
+    /sbin/vgremove "$@" 6>&- 7>&-
+}
+
+lvcreate() {
+    /sbin/lvcreate "$@" 6>&- 7>&-
+}
+
+lvremove() {
+    /sbin/lvremove "$@" 6>&- 7>&-
+}
+
+findfs() {
+    partprobe /dev/mapper/* 2>/dev/null
+    udevadm settle
+    /sbin/blkid -c /dev/null -l -o device -t "$@"
+}
+
+# reboot wrapper
+#   cleanup before reboot
+reboot() {
+    cd /
+    rc=0
+    if [ "$OVIRT_ISCSI_ENABLED" != "y" ]; then
+        # setup new Root if update is prepared
+        root_update_dev="$(findfs LABEL=RootUpdate 2>/dev/null)"
+        if [ -n "$root_update_dev" ]; then
+            set -x
+            root_dev="$(findfs LABEL=Root 2>/dev/null)"
+            e2label "$root_dev" RootBackup || rc=1
+            e2label "$root_update_dev" Root || rc=1
+            set +x
+        fi
+    fi
+    if [ $rc -ne 0 ]; then
+        log "Relabeling failed, please check logs"
+        return 1
+    fi
+    # run post-install hooks
+    # e.g. to avoid reboot loops using Cobbler PXE only once
+    # Cobbler XMLRPC post-install trigger (XXX is there cobbler SRV record?):
+    # wget "http://192.168.50.2/cblr/svc/op/trig/mode/post/system/$(hostname)"
+    #   -O /dev/null
+    for hook in $(ls /etc/ovirt-config-boot.d/* 2>/dev/null); do
+        $hook
+        rc=$?
+        if [ $? -ne 0 ]; then
+            log "Hook \"$hook\" failed."
+        fi
+    done
+    /sbin/reboot
+}
+
+# chkconfig_persist <servicename>
+#   since symlinks cannot be persisted, replace symlinks with hardlinks and persist
+chkconfig_persist() {
+    local service=$1
+    if [ -z "$service" ]; then
+        return 1
+    fi
+    cd /etc/rc.d
+    local to_persist=""
+    for f in rc*.d/[S,K]??$service ; do
+        local dir=$(dirname $f)
+        local name=$(basename $f)
+        cd $dir
+        link=$(readlink $name)
+        if [ -e "$link" ]; then
+            rm -f $name
+            ln $link $name
+            to_persist="$to_persist /etc/rc.d/$f"
+        fi
+        cd ..
+    done
+    ovirt_store_config $to_persist
+}
+
+# Asks a yes or no question. Accepts Y/N/A so users can abort.
+# RC=0 - Y/y entered
+# RC=1 - N/n entered
+# RC=2 - A/a entered
+# $1 - the prompt to use
+# $2 - require a response (def. true)
+# $3 - allow aborting (def. false)
+ask_yes_or_no () {
+    local prompt=${1}
+    local required=${2-true}
+    local allow_abort=${3-false}
+
+    while true; do
+        read -ep "${prompt} "
+        case $REPLY in
+            Y|y) return 0;;
+            N|n) return 1;;
+            A|a) if $allow_abort; then return 2; fi ;;
+            *)
+                if [ $required == false ]; then
+                    return 99
+                fi
+                ;;
+        esac
+    done
+}
+
+# Verifies the address entered is a valid IPv4 address.
+is_valid_ipv4 () {
+    local address=${1}
+    local result=1
+
+    if [[ "$address" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+        oldIFS="$IFS"
+        IFS='.'
+        ip=($address)
+        IFS="$oldIFS"
+        [[ ${ip[0]} -le 255 && ${ip[1]} -le 255 \
+            && ${ip[2]} -le 255 && ${ip[3]} -le 255 ]]
+        result=$?
+    fi
+
+    return $result
+}
+
+# Check if networking is already up
+network_up () {
+    ip addr show | grep -q "inet.*scope global"
+}
+
+# wipe mbr from disks
+wipe_mbr () {
+    local drive="$1"
+    log "Wiping old boot sector"
+    dd if=/dev/zero of="$drive" bs=1024K count=1
+    # zero out the GPT secondary header
+    log "Wiping secondary gpt header"
+    local disk_kb_count=$(sfdisk -s "$drive" 2>/dev/null)
+    dd if=/dev/zero of="$drive" bs=1024 seek=$(($disk_kb_count - 1)) count=1
+    kpartx -d "$drive"
+}
+
+# Cleans partition tables
+wipe_partitions() {
+    local drive="$1"
+    wipe_mbr "$drive"
+    # disable HostVG/Swap before removing from dmtable
+    if [ -L /dev/mapper/HostVG-Swap ]; then
+        swapoff -a
+    fi
+    # remove remaining HostVG entries from dmtable
+    for lv in $(find /dev/mapper/HostVG*); do
+        dmsetup remove $lv
+    done
+}
+
+test_ntp_configuration () {
+    # stop ntpd service for testing
+    service ntpd stop > /dev/null 2>&1
+    SERVERS=$(echo $NTPSERVERS | awk 'BEGIN{FS=":"}{for (i=1; i<=NF; i++) print $i}')
+        for server in $SERVERS; do
+            ntpdate $server > /dev/null 2>&1
+            result=$?
+            if [ $result -ne 0 ]; then
+                printf "\n Unable to verify NTP server: $server \n"
+            else
+                printf "\n Verified NTP server: $server \n"
+            fi
+        done
+    service ntpd start
+
+}
+
+get_dm_device ()
+{
+    local device="$1"
+    major=$(stat -c '%t' "$(readlink -f "$device")")
+    minor=$(stat -c '%T' "$(readlink -f "$device")")
+    local dm_device=
+    local rc=1
+    oldIFS="$IFS"
+    IFS=$'\n'
+    for dm in /dev/mapper/*; do
+        if [ $major = $(stat -c '%t' "$(readlink -f "$dm")") -a \
+            $minor = $(stat -c '%T' "$(readlink -f "$dm")") ]; then
+            dm_device="$dm"
+            rc=0
+            break
+        fi
+    done
+    IFS="$oldIFS"
+    echo "$dm_device"
+
+    return $rc
+}
+
+#get Multipath device for given /dev/sdX device
+#return sdX device if no multipath device
+translate_multipath_device() {
+    #trim so that only sdX is stored, but support passing /dev/sdX
+    local dev="$1"
+    local dm_dev
+
+    if [ -z "$dev" ]; then
+        return 1
+    fi
+    if [[ "$dev" =~ "/dev/mapper" ]]; then
+        echo "$dev"
+        return 0
+    elif [[ "$dev" =~ "/dev/cciss" ]]; then
+        #rename to cciss!device
+        dev2="cciss\!$(basename "$dev")"
+        dm_dev="/dev/$(basename $(ls -d /sys/block/$dev2/holders/dm* | head -n1))"
+        if [ -z "$dm_dev" ]; then
+            echo "$dev"
+            return
+        fi
+    else
+
+        if ! multipath -ll "$dev" 2>&1 >/dev/null; then
+            echo "$dev"
+            return
+        fi
+        dm_dev=/dev/$(multipath -ll "$dev" | egrep dm-[0-9]+ | sed -r 's/^.* (dm-[0-9]+) .*$/\1/')
+    fi
+
+    local mpath_device=$(get_dm_device "$dm_dev")
+
+    if [ -z "$mpath_device" ]; then
+        echo "$dev"
+    else
+        echo "$mpath_device"
+    fi
+}
+
+#Function to determine partition and device names
+get_part_info() {
+    local drive_in="$1"
+    local dev_var=$2
+    local part_var=$3
+    local grub_dev=$4
+    local devname_1 devname2 part_number
+    local rc=0
+
+    if [ -z "$grub_dev" ]; then
+        eval "$(translate_multipath_device "$drive_in" | awk '{
+            print "devname_1=\"" substr($0,1,length($0)-1) "\"";
+            print "devname_2=\"" substr($0,1,length($0)-2) "\"";
+            part_number=substr($0,length($0),1);
+            print "part_number=" part_number;
+        }')"
+    else
+        eval "$(translate_multipath_device "$drive_in" | awk '{
+            print "devname_1=\"" substr($0,1,length($0)-1) "\"";
+            print "devname_2=\"" substr($0,1,length($0)-2) "\"";
+            part_number=substr($0,length($0),1); part_number--;
+            print "part_number=" part_number;
+        }')"
+    fi
+    rc=$?
+
+    if [ "$part_number" -lt 1 -a "$grub_dev" != "y" ]; then
+        log "Partition number was invalid"
+        return 2
+    fi
+
+    if [ -e "$devname_1" ]; then
+        eval "$dev_var=\"$devname_1\""
+    elif [ -e "$devname_2" ]; then
+        eval "$dev_var=\"$devname_2\""
+    else
+        return 1
+    fi
+    eval "$part_var=$part_number"
+    return $rc
+}
+
+log_only() {
+    echo "$@" >> $OVIRT_TMP_LOGFILE
+}
+
+autoinstall_failed(){
+    plymouth --hide-splash
+    log "Automatic installation failed. Please review console messages."
+    log "Press Enter to drop to emergency shell."
+    [[ -f "/tmp/ovirt.log" ]] && {
+        cat /tmp/ovirt.log >> /var/log/ovirt.log
+    }
+    read < /dev/console
+    bash < /dev/console > /dev/console 2> /dev/console
+    plymouth --show-splash
+}
+
+get_base_device() {
+    dev=$1
+    if [ -e "${dev%?}" ]; then
+        echo "${dev%?}"
+        return 0
+    elif [ -e "${dev%p?}" ]; then
+        echo "${dev%p?}"
+        return 0
+    else
+        return 1
+    fi
+}
+
+get_boot_device() {
+    ROOT=$(get_base_device $(findfs LABEL=Root))
+    ROOTBACKUP=$(get_base_device $(findfs LABEL=RootBackup))
+    if [ "$ROOT" = "$ROOTBACKUP" ]; then
+        echo "$ROOT"
+        return 0
+    else
+        return 1
+    fi
+}
+
+_pyovirtfunctions()
+{
+    python <<EOP
+from ovirtnode.ovirtfunctions import *
+$@
+EOP
+}
+
+create_minimal_etc_hosts_file()
+{
+    _pyovirtfunctions "create_minimal_etc_hosts_file()"
+}
+
+load_keyboard_config ()
+{
+    python <<EOP
+import ovirtnode.ovirtfunctions as ovirtfunctions
+ovirtfunctions.load_keyboard_config()
+EOP
+}
+
+configure_dns ()
+{
+    python <<EOP
+import ovirtnode.network
+network = ovirtnode.network.Network()
+network.configure_dns()
+EOP
+}
+
+# execute a function if called as a script, e.g.
+#   ovirt-functions ovirt_store_config /etc/hosts
+
+if [ "$(basename -- "$0")" = "ovirt-functions" ]; then
+    "$@"
+fi

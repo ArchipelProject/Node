@@ -1,0 +1,39 @@
+#!/bin/bash
+#
+# ovirt Start ovirt services
+#
+### BEGIN INIT INFO
+# Provides: ovirt
+# Required-Start: ovirt-awake
+# Default-Start: 2 3 4 5
+# Description: Performs managed node configuration functions.
+### END INIT INFO
+
+# Source functions library
+. /usr/libexec/ovirt-init-functions.sh
+
+prog=ovirt
+
+case "$1" in
+    start)
+        echo -n "Starting ovirt: "
+        start_ovirt
+        test $? == 0 && success || failure
+        echo
+        ;;
+    status)
+        status -l $prog
+        ;;
+    reload)
+        reload_ovirt
+        ;;
+    stop)
+        echo -n "Stopping ovirt: "
+        stop_ovirt
+        success
+        echo
+        ;;
+    *)
+        echo "Usage: ovirt {start}"
+        exit 2
+esac

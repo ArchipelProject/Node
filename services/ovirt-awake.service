@@ -1,0 +1,14 @@
+[Unit]
+Description=oVirt Node management server alert service
+After=ovirt-early.service
+Wants=ovirt-early.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+EnvironmentFile=-/etc/sysconfig/node-config
+ExecStart=/usr/libexec/ovirt-init-functions.sh start_ovirt_awake
+ExecStop=/usr/libexec/ovirt-init-functions.sh stop_ovirt_awake
+
+[Install]
+WantedBy=multi-user.target

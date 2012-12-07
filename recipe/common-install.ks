@@ -5,12 +5,12 @@ auth --useshadow --enablemd5
 selinux --enforcing
 firewall --disabled
 # TODO: the sizing of the image needs to be more dynamic
-part / --size 1280 --fstype ext2
+part / --size 1536 --fstype ext2
 
 # additional default boot parameters
 # Need to use deadline Scheduler for performance, rhbz#647301
 # VM timekeeping: Do not allow C2 state, rhbz#647300
-bootloader --timeout=30 --append="nomodeset check rootflags=ro crashkernel=512M-2G:64M,2G-:128M elevator=deadline install quiet rd_NO_LVM"
+bootloader --timeout=30 --append="check rootflags=ro crashkernel=512M-2G:64M,2G-:128M elevator=deadline install quiet rd_NO_LVM"
 
 # not included by default in Fedora 10 livecd initramfs
 device virtio_blk
@@ -68,4 +68,17 @@ device qla4xxx
 device qlogicfas408
 device stex
 device tmscsim
-
+#usb mass storage devices / blade cd devices / similar
+device ums-sddr09
+device ums-realtek
+device ums-sddr55
+device ums-isd200
+device ums-alauda
+device ums-freecom
+device ums-cypress
+device ums-jumpshot
+device ums-onetouch
+device ums-karma
+device ums-usbat
+device ums-datafab
+device ums-eneub6250

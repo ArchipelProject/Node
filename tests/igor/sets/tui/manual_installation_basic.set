@@ -1,0 +1,24 @@
+---
+description: 'A basic TUI installation'
+libs: ['../../libs/common', '../../libs/uinput']
+searchpath: '../../tcs'
+
+
+---
+filename: 'boot_completed.sh'
+
+---
+filename: 'wait_for_installer_welcome_page.sh'
+timeout: 70
+
+---
+filename: 'uinput/basic_tui_installation.py'
+# Timeout for install
+timeout: 300
+
+---
+filename: 'reboot_completed.sh'
+# Timeout for reboot
+timeout: 70
+
+---

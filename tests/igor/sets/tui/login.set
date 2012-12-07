@@ -1,0 +1,13 @@
+---
+description: 'Log in to the TUI using teh passwod in after_auto_install.set'
+libs: ['../../libs/common', '../../libs/uinput']
+searchpath: '../../tcs'
+
+
+---
+filename: 'wait_for_getty.sh'
+
+---
+filename: 'uinput/login_as_admin.py'
+
+---

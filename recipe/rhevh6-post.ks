@@ -11,7 +11,6 @@ EOF_RWTAB_RHEVH
 
 # convenience symlinks
 ln -s /usr/libexec/ovirt-config-rhn /sbin/rhn_register
-ln -s /usr/libexec/ovirt-config-setup /usr/sbin/setup
 
 # in RHEV-H *.py are blacklisted
 cat > /etc/cron.d/rhn-virtualization.cron << \EOF_cron-rhn
@@ -35,13 +34,13 @@ cpe:/o:redhat:enterprise_linux:6:update2:hypervisor
 EOF_CPE
 
 patch -d /usr/share/rhn/up2date_client -p0 << \EOF_up2date_patch2
---- up2dateErrors.py.orig       2011-07-02 11:06:46.000000000 +0000
-+++ up2dateErrors.py    2011-07-02 11:09:19.000000000 +0000
-@@ -13,7 +13,20 @@
+--- up2dateErrors.py.orig	2012-02-17 14:28:19.798545090 -0500
++++ up2dateErrors.py	2012-02-17 14:49:07.638959433 -0500
+@@ -13,7 +13,34 @@
  _ = t.ugettext
  import OpenSSL
  import config
--from yum.Errors import RepoError
+-from yum.Errors import RepoError, YumBaseError
 +
 +class RepoError(Exception):
 +    """
@@ -56,43 +55,25 @@ patch -d /usr/share/rhn/up2date_client -p0 << \EOF_up2date_patch2
 +
 +    def __unicode__(self):
 +        return '%s' % to_unicode(self.value)
++
++class YumBaseError(Exception):
++    """
++    Base Yum Error. All other Errors thrown by yum should inherit from
++    this.
++    """
++    def __init__(self, value=None):
++        Exception.__init__(self)
++        self.value = value
++    def __str__(self):
++        return "%s" %(self.value,)
++
++    def __unicode__(self):
++        return '%s' % to_unicode(self.value)
  
- class Error:
+ class Error(YumBaseError):
      """base class for errors"""
 EOF_up2date_patch2
 python -m compileall /usr/share/rhn/up2date_client
-
-patch -d /usr/share/rhn/virtualization -p0 << \EOF_rhn_virt
---- poller.py.orig 2011-04-19 15:53:43.000000000 +0000
-+++ poller.py 2011-09-08 20:45:49.000000000 +0000
-@@ -73,10 +73,9 @@
-         return {}
-
-     try:
--        conn = libvirt.open(None)
-+        conn = libvirt.openReadOnly(None)
-     except libvirt.libvirtError, lve:
-         # virConnectOpen() failed
--        sys.stderr.write("Warning: Could not retrieve virtualization information!\n\tlibvirtd service needs to be running.\n")
-         conn = None
-
-     if not conn:
-@@ -286,10 +285,10 @@
-         vdsm_enabled = True
-
-     # Crawl each of the domains on this host and obtain the new state.
--    if vdsm_enabled:
--        domain_list = poll_through_vdsm()
--    elif libvirt:
-+    if libvirt:
-         domain_list = poll_hypervisor()
-+    elif vdsm_enabled:
-+        domain_list = poll_through_vdsm()
-     else:
-         # If no libvirt nor vdsm is present, this program is pretty much
-         # useless.  Just exit.
-EOF_rhn_virt
-python -m compileall /usr/share/rhn/virtualization
 
 echo "Configuring SELinux"
 # custom module for node specific rules
@@ -232,20 +213,20 @@ EOF_halt
 # rhbz#675868
 # Modify rc.sysinit
 patch -d /etc/rc.d -p0 << \EOF_rc_sysinit
---- rc.sysinit.orig	2011-04-06 09:11:18.126385229 -0400
-+++ rc.sysinit	2011-04-06 09:11:04.195923990 -0400
+--- rc.sysinit.orig	2012-09-11 09:41:22.545431354 +0530
++++ rc.sysinit	2012-09-11 09:52:59.619523468 +0530
 @@ -43,7 +43,7 @@
  fi
  
  if [ -n "$SELINUX_STATE" -a -x /sbin/restorecon ] && __fgrep " /dev " /proc/mounts >/dev/null 2>&1 ; then
--	/sbin/restorecon  -R /dev 2>/dev/null
+-	/sbin/restorecon -R -F /dev 2>/dev/null
 +	/sbin/restorecon -e /dev/.initramfs -R /dev 2>/dev/null
  fi
  
  disable_selinux() {
-@@ -495,9 +495,9 @@
- # mounted). Contrary to standard usage,
+@@ -497,9 +497,9 @@
  # filesystems are NOT unmounted in single user mode.
+ # The 'no' applies to all listed filesystem types. See mount(8).
  if [ "$READONLY" != "yes" ] ; then
 -	action $"Mounting local filesystems: " mount -a -t nonfs,nfs4,smbfs,ncpfs,cifs,gfs,gfs2 -O no_netdev
 +	action $"Mounting local filesystems: " mount -a -t nonfs,nfs4,smbfs,ncpfs,cifs,gfs,gfs2,noproc,nosysfs,nodevpts -O no_netdev
