@@ -65,7 +65,7 @@ else
     chkconfig --add ovirt-firstboot
     chkconfig --add ovirt-post
     # Hack to make python-sqlalchemy0.7 working on centos. seriously this sucks
-    mv /usr/lib64/python2.6/site-packages/SQLAlchemy-0.7.3-py2.6-linux-$(uname -m).egg/sqlalchemy /usr/lib64/python2.6/site-packages/
+    mv /usr/lib64/python2.6/site-packages/SQLAlchemy-*-py*-linux-$(uname -m).egg/sqlalchemy /usr/lib64/python2.6/site-packages/
 fi
 
 echo "Configuring IPTables"

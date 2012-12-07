@@ -1,4 +1,4 @@
 collectd-virt
-virt-who
+#virt-who
 libguestfs-winsupport
 qemu-kvm
