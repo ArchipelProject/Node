@@ -24,3 +24,6 @@ scripts/collectd.conf
 *manifest
 py-compile
 scripts/ovirt-functions
+.project
+.pydevproject
+.settings

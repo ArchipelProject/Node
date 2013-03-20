@@ -32,9 +32,6 @@ rm -f /etc/libvirt/qemu/networks/autostart/default.xml
 # rhevh uses libvirtd upstart job, sysv initscript must not interfere
 rm -f /etc/rc.d/init.d/libvirtd
 
-# remove the /etc/krb5.conf file; it will be fetched on bootup
-rm -f /etc/krb5.conf
-
 # Remove the default logrotate daily cron job
 # since we run it every 10 minutes instead.
 rm -f /etc/cron.daily/logrotate
@@ -101,8 +98,6 @@ dirs	/var/lib/net-snmp
 dirs    /var/lib/dnsmasq
 files	/root/.ssh
 dirs	/root/.uml
-dirs	/root/.virt-manager
-dirs	/home/admin/.virt-manager
 files	/var/cache/libvirt
 files	/var/empty/sshd/etc/localtime
 files	/var/lib/libvirt
@@ -133,12 +128,6 @@ set /files/etc/sysconfig/kdump/KDUMP_BOOTDIR /boot-kdump
 set /files/etc/sysconfig/kdump/MKDUMPRD_ARGS --allow-missing
 save
 EOF_kdump
-
-cat > /etc/snmp/snmpd.conf << \EOF_snmpd
-master agentx
-dontLogTCPWrappersConnects yes
-rwuser root auth .1
-EOF_snmpd
 
 # add admin user for configuration ui
 useradd admin
@@ -217,12 +206,6 @@ echo "StrictHostKeyChecking no" >> /etc/ssh/ssh_config
 #mount kernel debugfs
 echo "debugfs /sys/kernel/debug debugfs auto 0 0" >> /etc/fstab
 
-# create .virt-manager directories for readonly root
-mkdir -p /root/.virt-manager /home/admin/.virt-manager
-
-#symlink virt-manager-tui pointer file to .pyc version
-sed -i "s/tui.py/tui.pyc/g" /usr/bin/virt-manager-tui
-
 #symlink ovirt-config-setup into $PATH
 ln -s /usr/libexec/ovirt-config-setup /usr/sbin/setup
 
@@ -242,18 +225,19 @@ set /files/etc/ssh/sshd_config/ClientAliveCountMax 0
 save
 EOF_sshd_config
 
-#CIM related changes
-# set read-only
-echo "readonly = true;" > /etc/libvirt-cim.conf
-groupadd cim
-useradd -g cim -G sfcb -s /sbin/nologin cim
-
 # disable yum repos by default
-augtool << \EOF_yum
-set /files/etc/yum.repos.d/fedora.repo/fedora/enabled 0
-set /files/etc/yum.repos.d/fedora-updates.repo/updates/enabled 0
-save
-EOF_yum
+rm -f /tmp/yum.aug
+for i in $(augtool match /files/etc/yum.repos.d/*/*/enabled 1); do
+    echo "set $i 0" >> /tmp/yum.aug
+done
+if [ -f /tmp/yum.aug ]; then
+    echo "save" >> /tmp/yum.aug
+    augtool < /tmp/yum.aug
+    rm -f /tmp/yum.aug
+fi
+
+# cleanup yum directories
+rm -rf /var/lib/yum/*
 
 #cleanup tmp directory from cim setup
 rm -rf /tmp/cim_schema*

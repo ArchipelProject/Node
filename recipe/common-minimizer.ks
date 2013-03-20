@@ -1,12 +1,9 @@
 droprpm system-config-*
 keeprpm system-config-keyboard-base
-droprpm libsemanage-python
 
 droprpm mkinitrd
 droprpm checkpolicy
 droprpm make
-droprpm setools-libs-python
-droprpm setools-libs
 
 droprpm gamin
 droprpm pm-utils
@@ -38,7 +35,7 @@ droprpm postfix
 droprpm mysql*
 
 droprpm sysklogd
-
+droprpm selinux-policy-devel
 # pam complains when this is missing
 keeprpm ConsoleKit-libs
 
@@ -166,6 +163,7 @@ keep /usr/share/augeas/lenses/dist/shellvars.aug
 keep /usr/share/augeas/lenses/dist/spacevars.aug
 keep /usr/share/augeas/lenses/dist/sysctl.aug
 keep /usr/share/augeas/lenses/dist/util.aug
+keep /usr/share/augeas/lenses/dist/simplevars.aug
 # whitelist only relevant lenses
 keep /usr/share/augeas/lenses/dist/buildd.aug
 keep /usr/share/augeas/lenses/dist/cgconfig.aug
@@ -328,7 +326,6 @@ droprpm gamin
 droprpm gnupg2
 droprpm hdparm
 droprpm libicu
-droprpm libsemanage-python
 droprpm linux-atm-libs
 droprpm make
 droprpm mtools
@@ -342,19 +339,14 @@ droprpm perl-Pod-Simple
 droprpm perl-Scalar-List-Utils
 droprpm perl-hivex
 droprpm perl-macros
-droprpm setools-libs
-droprpm setools-libs-python
 droprpm sgpio
 droprpm syslinux
 droprpm system-config-firewall-base
 droprpm usermode
 
 #NFS Server
-droprpm rpcbind
-drop /usr/sbin/rpc.idmapd
 drop /usr/bin/rpcgen
 drop /usr/sbin/rpc.gssd
-drop /usr/sbin/rpc.idmapd
 drop /usr/sbin/rpc.mountd
 drop /usr/sbin/rpc.nfsd
 drop /usr/sbin/rpc.svcgssd

@@ -168,7 +168,14 @@ start_ovirt_early () {
     [ -f "$VAR_SUBSYS_NODECONFIG" ] && exit 0
     {
         # FIXME Hack around rhbz#806349 and which might be because of rhbz#807203
-        mount -a
+        if [[ -e "/bin/systemctl" ]];
+        then
+            systemctl daemon-reload
+        else
+            mount -a
+            swapon -a
+        fi
+
         log "Starting ovirt-early"
         _start_ovirt_early
         RETVAL=$?
@@ -383,12 +390,6 @@ _start_ovirt_early () {
     # save boot parameters like console= for local disk boot menu
     bootparams=
     cat /etc/system-release >> $OVIRT_LOGFILE
-    # determine iscsi_install status
-    if grep -q iscsi_install /proc/cmdline; then
-        iscsi_install=0
-    else
-        iscsi_install=1
-    fi
 
     for i in $(cat /proc/cmdline); do
         case $i in
@@ -877,12 +878,19 @@ EOF
         log "Rescue mode requested, starting emergency shell"
         stop_log
         plymouth --hide-splash
-        bash < /dev/console > /dev/console 2> /dev/console
+        echo "Rescue mode requested, starting emergency shell" > /dev/tty1
+        openvt -f -c 1 -w -s -l -- bash
         plymouth --show-splash
         start_log
     fi
 
-    # link to the kernel image for kdump
+    if [[ -e "/run/initramfs" ]]; then
+        log "bind omunting /run/initramfs to /dev/.initramfs for compatability"
+        mkdir /dev/.initramfs
+        mount --rbind /run/initramfs /dev/.initramfs
+    fi
+
+    log "link to the kernel image for kdump"
     chcon -t boot_t /boot-kdump
     if is_booted_from_local_disk; then
         mount_boot
@@ -1126,7 +1134,7 @@ EOP
         plymouth --hide-splash
 
         export LVM_SUPPRESS_FD_WARNINGS=0
-        /usr/libexec/ovirt-config-installer -x < /dev/console
+        /usr/bin/ovirt-node-installer
 
         plymouth --show-splash
     fi
@@ -1154,20 +1162,6 @@ ovirt_start() {
     if is_standalone; then
         return 0
     fi
-    find_srv ipa tcp
-    if [ -n "$SRV_HOST" -a -n "$SRV_PORT" ]; then
-        krb5_conf=/etc/krb5.conf
-        # FIXME this is IPA specific
-        wget -q --no-check-certificate \
-            http://$SRV_HOST:$SRV_PORT/ipa/config/krb5.ini -O $krb5_conf.tmp
-        if [ $? -ne 0 ]; then
-            log "Failed to get $krb5_conf"; return 1
-        fi
-        mv $krb5_conf.tmp $krb5_conf
-    else
-        log "skipping Kerberos configuration"
-    fi
-
 
     find_srv collectd udp
     if [ -n "$SRV_HOST" -a -n "$SRV_PORT" ]; then
@@ -1228,6 +1222,10 @@ start_ovirt_post() {
     {
         log "Starting ovirt-post"
 
+        #make sure swap and all other partitions are mounted
+        swapon -a
+        mount -a
+
         # Re-load keyboard settings
         load_keyboard_config 2> /dev/null
 
@@ -1282,10 +1280,8 @@ start_ovirt_post() {
 
         # persist selected configuration files
         ovirt_store_config \
-            /etc/krb5.conf \
             /etc/node.d \
             /etc/sysconfig/node-config \
-            /etc/libvirt/krb5.tab \
             /etc/ssh/ssh_host*_key*
 
         . /usr/libexec/ovirt-functions

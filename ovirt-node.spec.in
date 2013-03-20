@@ -34,7 +34,6 @@ Requires(post):     systemd-units
 Requires(preun):    systemd-units
 #Requires:       python-augeas
 Requires:       glusterfs-client >= 2.0.1
-Requires:       anyterm
 Requires:       python-IPy
 Requires:       grub2
 Requires:       system-release
@@ -47,7 +46,6 @@ Requires:       cyrus-sasl-gssapi cyrus-sasl >= 2.1.22
 Requires:       iscsi-initiator-utils
 Requires:       ntp
 Requires:       nfs-utils
-Requires:       krb5-workstation
 Requires:       bash
 Requires:       chkconfig
 Requires:       bind-utils
@@ -123,6 +121,37 @@ This package provides an snmp plugin tools for use with%{product_family} image.
 %post plugin-snmp
 systemctl enable snmpd.service
 
+cat > /etc/snmp/snmpd.conf << \EOF_snmpd
+master agentx
+dontLogTCPWrappersConnects yes
+rwuser root auth .1
+EOF_snmpd
+
+
+%package plugin-cim
+Summary:        CIM plugin for %{product_family} image
+Group:          Applications/System
+Requires:       libvirt-cim
+Requires:       sblim-sfcb
+
+%description plugin-cim
+This package provides a cim plugin for use with%{product_family} image.
+
+%post plugin-cim
+groupadd cim
+useradd -g cim -G sfcb -s /sbin/nologin cim
+%if ! %{is_systemd}
+/sbin/chkconfig --add ovirt-cim
+%else
+if [ $1 -eq 1 ] ; then
+    # Initial installation
+    /bin/systemctl daemon-reload >/dev/null 2>&1 || :
+fi
+%endif
+#CIM related changes
+# set read-only
+echo "readonly = true;" > /etc/libvirt-cim.conf
+
 %prep
 %setup -q
 
@@ -159,6 +188,14 @@ make install DESTDIR=%{buildroot}
 # specific version of python-augeas is not available in Fedora yet
 %{__install} -p -m0644 scripts/augeas.py %{buildroot}%{python_sitelib}
 
+# Build and install the new TUI
+pushd .
+cd scripts/tui/
+make -f makefile.legacy install python=%{__python} prefix=%{_prefix} root=%{buildroot}
+# Remove some extra data
+rm -rf %{buildroot}/usr/extra
+popd .
+
 
 %clean
 %{__rm} -rf %{buildroot}
@@ -172,7 +209,6 @@ make install DESTDIR=%{buildroot}
 /sbin/chkconfig --add ovirt-firstboot
 /sbin/chkconfig --add ovirt
 /sbin/chkconfig --add ovirt-post
-/sbin/chkconfig --add ovirt-cim
 %else
 if [ $1 -eq 1 ] ; then
     # Initial installation
@@ -211,13 +247,11 @@ if [ $1 = 0 ] ; then
     /sbin/service ovirt-firstboot stop >/dev/null 2>&1
     /sbin/service ovirt stop >/dev/null 2>&1
     /sbin/service ovirt-post stop >/dev/null 2>&1
-    /sbin/service ovirt-cim stop >/dev/null 2>&1
     /sbin/chkconfig --del ovirt-awake
     /sbin/chkconfig --del ovirt-early
     /sbin/chkconfig --del ovirt-firstboot
     /sbin/chkconfig --del ovirt
     /sbin/chkconfig --del ovirt-post
-    /sbin/chkconfig --del ovirt-cim
 fi
 %else
 if [ $1 -eq 0 ] ; then
@@ -226,15 +260,26 @@ if [ $1 -eq 0 ] ; then
     /bin/systemctl --no-reload disable ovirt.service > /dev/null 2>&1 || :
     /bin/systemctl --no-reload disable ovirt-post.service > /dev/null 2>&1 || :
     /bin/systemctl --no-reload disable ovirt-early.service > /dev/null 2>&1 || :
-    /bin/systemctl --no-reload disable ovirt-cim.service > /dev/null 2>&1 || :
 
     /bin/systemctl stop ovirt.service > /dev/null
     /bin/systemctl stop ovirt-post.service > /dev/null
     /bin/systemctl stop ovirt-early.service > /dev/null
-    /bin/systemctl stop ovirt-cim.service > /dev/null
 fi
 %endif
 
+%preun plugin-cim
+%if ! %{is_systemd}
+if [ $1 = 0 ] ; then
+    /sbin/service ovirt-cim stop >/dev/null 2>&1
+    /sbin/chkconfig --del ovirt-cim
+fi
+%else
+if [ $1 -eq 0 ] ; then
+    # Package removal, not upgrade
+    /bin/systemctl --no-reload disable ovirt-cim.service > /dev/null 2>&1 || :
+    /bin/systemctl stop ovirt-cim.service > /dev/null
+fi
+%endif
 
 %files recipe
 %defattr(0644,root,root,0755)
@@ -252,6 +297,19 @@ fi
 %files plugin-snmp
 %{python_sitelib}/ovirt_config_setup/snmp.py
 %{_sysconfdir}/ovirt-plugins.d/snmp.minimize
+%{_sysconfdir}/ovirt-config-boot.d/snmp_autoinstall.py
+
+%files plugin-cim
+%{python_sitelib}/ovirt_config_setup/cim.py
+%{_sysconfdir}/ovirt-plugins.d/cim.minimize
+%if %{is_systemd}
+%{_unitdir}/ovirt-cim.service
+%else
+%{_initrddir}/ovirt-cim
+%endif
+
+
+
 
 %files
 %defattr(-,root,root)
@@ -262,6 +320,7 @@ fi
 
 %{mgmt_scripts_dir}
 %{_sysconfdir}/ovirt-config-boot.d
+%exclude %{_sysconfdir}/ovirt-config-boot.d/snmp_autoinstall.py*
 %config(noreplace) %{_sysconfdir}/sysconfig/node-config
 
 %if %{is_f16}
@@ -301,6 +360,7 @@ fi
 %{_sbindir}/persist
 %{_sbindir}/unpersist
 %{python_sitelib}/ovirt_config_setup
+%exclude %{python_sitelib}/ovirt_config_setup/cim.py*
 %exclude %{python_sitelib}/ovirt_config_setup/snmp.py*
 %{python_sitelib}/ovirtnode
 %{python_sitelib}/augeas*
@@ -312,15 +372,21 @@ fi
 %{_unitdir}/ovirt-firstboot.service
 %{_unitdir}/ovirt-post.service
 %{_unitdir}/ovirt-early.service
-%{_unitdir}/ovirt-cim.service
 %else
 %{_initrddir}/ovirt-awake
 %{_initrddir}/ovirt-early
 %{_initrddir}/ovirt-firstboot
 %{_initrddir}/ovirt
 %{_initrddir}/ovirt-post
-%{_initrddir}/ovirt-cim
 %endif
+# Files related to the new TUI
+%{python_sitelib}/ovirt_node_molch*.egg-info
+%{python_sitelib}/ovirt/__init__.*
+%{python_sitelib}/ovirt/node/*
+%{_bindir}/ovirt-config-setup
+%{_bindir}/ovirt-node-installer
+%{_bindir}/ovirt-node-doc
+
 
 
 %changelog

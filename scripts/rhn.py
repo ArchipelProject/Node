@@ -28,7 +28,7 @@ import _snack
 
 RHN_CONFIG_FILE = "/etc/sysconfig/rhn/up2date"
 RHSM_CONFIG_FILE = "/etc/rhsm/rhsm.conf"
-
+RHN_XMLRPC_ADDR = "https://xmlrpc.rhn.redhat.com/XMLRPC"
 
 def run_rhnreg(serverurl="", cacert="", activationkey="", username="",
                password="", profilename="", proxyhost="", proxyuser="",
@@ -99,12 +99,8 @@ def run_rhnreg(serverurl="", cacert="", activationkey="", username="",
 
     logger.info("Registering to RHN account.....")
 
-    unmount_config("/etc/sysconfig/rhn/systemid")
-    unmount_config("/etc/sysconfig/rhn/up2date")
-    # regenerate up2date config
-    if os.path.exists("/etc/sysconfig/rhn/up2date"):
-        os.unlink("/etc/sysconfig/rhn/up2date")
-
+    remove_config("/etc/sysconfig/rhn/systemid")
+    remove_config("/etc/sysconfig/rhn/up2date")
     logged_args = list(args)
     remove_values_from_args = ["--password", "--proxyPassword"]
     for idx, arg in enumerate(logged_args):
@@ -310,25 +306,32 @@ def get_rhn_config():
 
 
 def rhn_check():
-    rhncheck_cmd = subprocess_closefds("rhn_check", shell=False,
-                                       stdout=PIPE, stderr=STDOUT)
-    rhncheck = rhncheck_cmd.communicate()[0]
-    if rhncheck_cmd.returncode == 0:
-        return True
+    filebased = True
+    registered = False
+    if filebased:
+        # Thefollowing file exists when the sys is registered with rhn
+        registered = os.path.exists("/etc/sysconfig/rhn/systemid")
     else:
-        return False
+        rhncheck_cmd = subprocess_closefds("rhn_check", shell=False,
+                                           stdout=PIPE, stderr=STDOUT)
+        rhncheck = rhncheck_cmd.communicate()[0]
+        if rhncheck_cmd.returncode == 0:
+            registered = True
+    return registered
 
 
 def sam_check():
-    samcheck_cmd = subprocess_closefds("subscription-manager identity",
-                                       shell=True, stdout=PIPE,
-                                       stderr=open('/dev/null', 'w'))
-    samcheck = samcheck_cmd.communicate()[0]
-    if samcheck_cmd.returncode == 0:
-        return True
+    filebased = True
+    registered = False
+    if filebased:
+        # Thefollowing file exists when the sys is registered with a sat server
+        registered = os.path.exists("/etc/rhsm/ca/candlepin-local.pem")
     else:
-        return False
-
+        samcheck_cmd = subprocess_closefds("subscription-manager identity",
+                                           shell=True, stdout=PIPE,
+                                           stderr=open('/dev/null', 'w'))
+        registered = "identity is:" in samcheck_cmd.stdout.read()
+    return registered
 
 def get_rhn_status():
     msg = ""
@@ -420,7 +423,7 @@ def rhn_auto():
         if reg_rc == 2:
             msg = "Invalid Username / Password "
         elif reg_rc == 3:
-            msg = "Unable to retreive satellite certificate"
+            msg = "Unable to retrieve satellite certificate"
         else:
             msg = "Check ovirt.log for details"
             logger.info("RHN Configuration Failed")
@@ -437,6 +440,8 @@ class Plugin(PluginBase):
     def __init__(self, ncs):
         PluginBase.__init__(self, "Red Hat Network", ncs)
         self.rhn_conf = {}
+        self.INVALID_CA_CONFIG_MSG = ""
+        self.INVALID_URL_CONFIG_MSG = ""
 
     def form(self):
         elements = Grid(2, 12)
@@ -450,6 +455,7 @@ class Plugin(PluginBase):
         elements.setField(login_grid, 0, 4, anchorLeft=1)
         profile_grid = Grid(2, 2)
         self.profilename = Entry(30, "")
+        self.profilename.setCallback(self.profilename_callback)
         profile_grid.setField(Label("Profile Name (optional): "), 0, 0,
                                     anchorLeft=1)
         profile_grid.setField(self.profilename, 1, 0, anchorLeft=1)
@@ -526,8 +532,10 @@ class Plugin(PluginBase):
             pass
         self.rhn_actkey = Entry(40, "")
         if rhn_check():
-            if self.rhn_url.value() == "https://xmlrpc.rhn.redhat.com/XMLRPC" \
-                                        or len(self.rhn_url.value()) == 0:
+            if self.rhn_url.value() == RHN_XMLRPC_ADDR or \
+                                       len(self.rhn_url.value()) == 0 and \
+                                       RHN_XMLRPC_ADDR in \
+                                       self.rhn_conf["serverURL"]:
                 self.public_rhn.setValue("*")
                 self.rhn_url.setFlags(_snack.FLAG_DISABLED, _snack.FLAGS_SET)
                 self.rhn_ca.setFlags(_snack.FLAG_DISABLED, _snack.FLAGS_SET)
@@ -567,6 +575,16 @@ class Plugin(PluginBase):
         self.ncs.screen.setColor("ACTBUTTON", "blue", "white")
         if not network_up():
             return False
+        if (len(self.INVALID_URL_CONFIG_MSG) > 0 or
+                len(self.INVALID_CA_CONFIG_MSG) > 0):
+            self.ncs._create_warn_screen()
+            msg = "\n%s\n%s\n" % (self.INVALID_URL_CONFIG_MSG, self.INVALID_CA_CONFIG_MSG)
+            ButtonChoiceWindow(self.ncs.screen, "Configuration Check",
+                                msg, buttons=['Ok'])
+            self.ncs._set_title()
+            self.INVALID_URL_CONFIG_MSG = ""
+            self.INVALID_CA_CONFIG_MSG = ""
+            return False
         if self.rhn_satellite.value() == 1 and self.rhn_ca.value() == "":
             ButtonChoiceWindow(self.ncs.screen, "RHN Configuration",
                                "Please input a CA certificate URL",
@@ -577,13 +595,17 @@ class Plugin(PluginBase):
                                "Login/Password must not be empty\n",
                                buttons=['Ok'])
             return False
+        key_files = ["/etc/sysconfig/rhn/systemid",  # To check RHN
+                     "/etc/rhsm/ca/candlepin-local.pem"  # To check SAM
+                     ]
+        for key_file in key_files:
+            if os.path.exists(key_file):
+                remove_config(key_file)
+                os.remove(key_file)
         if self.sam.value() == 1:
             if os.path.exists(RHN_CONFIG_FILE):
                 remove_config(RHN_CONFIG_FILE)
                 os.remove(RHN_CONFIG_FILE)
-            if os.path.exists("/etc/sysconfig/rhn/systemid"):
-                remove_config("/etc/sysconfig/rhn/systemid")
-                os.remove("/etc/sysconfig/rhn/systemid")
             reg_rc = run_rhsm(serverurl=self.rhn_url.value(),
                 cacert=self.rhn_ca.value(),
                 activationkey=self.rhn_actkey.value(),
@@ -618,7 +640,7 @@ class Plugin(PluginBase):
             if reg_rc == 2:
                 msg = "Invalid Username / Password "
             elif reg_rc == 3:
-                msg = "Unable to retreive satellite certificate"
+                msg = "Unable to retrieve satellite certificate"
             else:
                 msg = "Check ovirt.log for details"
             ButtonChoiceWindow(self.ncs.screen, "RHN Configuration",
@@ -627,17 +649,28 @@ class Plugin(PluginBase):
             self.ncs.reset_screen_colors()
             return False
 
-    def rhn_url_callback(self):
-        # TODO URL validation
-        if not is_valid_url(self.rhn_url.value()):
+    def profilename_callback(self):
+        if self.profilename.value() is None:
+            return True
+        length = len(self.profilename.value())
+        if (length > 0 and length < 3):
             self.ncs._create_warn_screen()
             self.ncs.screen.setColor("BUTTON", "black", "red")
             self.ncs.screen.setColor("ACTBUTTON", "blue", "white")
             ButtonChoiceWindow(self.ncs.screen, "Configuration Check",
-                               "Invalid Hostname or Address", buttons=['Ok'])
+                               "RHN Profile Name must be at least 3 characters",
+                               buttons=['Ok'])
             self.ncs.reset_screen_colors()
             self.ncs.gridform.draw()
             self.ncs._set_title()
+
+    def rhn_url_callback(self):
+        # TODO URL validation
+        if not is_valid_url(self.rhn_url.value()):
+            self.INVALID_URL_CONFIG_MSG = "Invalid RHN URL entered"
+        else:
+            self.INVALID_URL_CONFIG_MSG = ""
+
         if self.rhn_satellite.value() == 1:
             host = self.rhn_url.value().replace("/XMLRPC", "")
 
@@ -647,18 +680,13 @@ class Plugin(PluginBase):
         if not self.rhn_ca.value() == "":
             if not is_valid_url(self.rhn_ca.value()):
                 if not os.path.exists(self.rhn_ca.value()):
-                    msg = "Invalid URL or Path"
+                    self.INVALID_CA_CONFIG_MSG = "Invalid CA URL or Path"
+                else:
+                    self.INVALID_CA_CONFIG_MSG = ""
+            else:
+                self.INVALID_CA_CONFIG_MSG = ""
         elif self.rhn_ca.value() == "":
-            msg = "Please input a CA certificate URL"
-        if not msg == "":
-            self.ncs.screen.setColor("BUTTON", "black", "red")
-            self.ncs.screen.setColor("ACTBUTTON", "blue", "white")
-            self.ncs._create_warn_screen()
-            ButtonChoiceWindow(self.ncs.screen, "Configuration Check", msg,
-                               buttons=['Ok'])
-            self.ncs.reset_screen_colors()
-            self.ncs.gridform.draw()
-            self.ncs._set_title()
+            self.INVALID_CA_CONFIG_MSG = "Please input a CA certificate URL"
 
     def rv(self, var):
         if var in self.rhn_conf:

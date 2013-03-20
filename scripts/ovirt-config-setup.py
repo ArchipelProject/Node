@@ -133,6 +133,7 @@ class NodeConfigScreen():
         self._plugins_enabled = False
         self._plugins_pagenum = 0
         self._ping_test = False
+        self.INVALID_KDUMP_MSG = ""
 
 
     def _set_title(self):
@@ -588,14 +589,17 @@ class NodeConfigScreen():
         self.kdump_ssh_config.setFlags(_snack.FLAG_DISABLED, _snack.FLAGS_SET)
 
     def kdump_valid_nfs_callback(self):
-        if not is_valid_nfs(self.kdump_nfs_config.value()):
-            self._create_warn_screen()
-            ButtonChoiceWindow(self.screen, "Configuration Check",
-                               "Invalid NFS Entry", buttons=['Ok'])
-            self.reset_screen_colors()
-            self.kdump_nfs_config.set("")
-            self.gridform.draw()
-            self._set_title()
+        if len(self.kdump_nfs_config.value()) > 0:
+            if not is_valid_nfs(self.kdump_nfs_config.value()):
+                self._create_warn_screen()
+                ButtonChoiceWindow(self.screen, "Configuration Check",
+                                "Invalid NFS Entry", buttons=['Ok'])
+                self.reset_screen_colors()
+                self.kdump_nfs_config.set("")
+                self.gridform.draw()
+                self._set_title()
+        else:
+            self.INVALID_KDUMP_MSG = "KDump NFS location cannot be empty"
 
     def kdump_ssh_callback(self):
         self.kdump_nfs_type.setValue(" 0")
@@ -605,14 +609,17 @@ class NodeConfigScreen():
                                        _snack.FLAGS_RESET)
 
     def kdump_valid_ssh_callback(self):
-        if not is_valid_user_host(self.kdump_ssh_config.value()):
-            self._create_warn_screen()
-            ButtonChoiceWindow(self.screen, "Configuration Check",
-                               "Invalid SSH Entry", buttons=['Ok'])
-            self.reset_screen_colors()
-            self.kdump_ssh_config.set("")
-            self.gridform.draw()
-            self._set_title()
+        if len(self.kdump_nfs_config.value()) > 0:
+            if not is_valid_user_host(self.kdump_ssh_config.value()):
+                self._create_warn_screen()
+                ButtonChoiceWindow(self.screen, "Configuration Check",
+                                "Invalid SSH Entry", buttons=['Ok'])
+                self.reset_screen_colors()
+                self.kdump_ssh_config.set("")
+                self.gridform.draw()
+                self._set_title()
+        else:
+            self.INVALID_KDUMP_MSG = "KDump SSH location cannot be empty"
 
     def kdump_restore_callback(self):
         self.kdump_ssh_type.setValue(" 0")
@@ -703,14 +710,15 @@ class NodeConfigScreen():
         return
 
     def valid_nfsv4_domain_callback(self):
-        if not is_valid_hostname(self.nfsv4_domain.value()):
-            self.nfsv4_domain.set("")
-            self._create_warn_screen()
-            ButtonChoiceWindow(self.screen, "Network", "Invalid NFS Domain",
-                               buttons=['Ok'])
-            self.reset_screen_colors()
-            self.gridform.draw()
-            self._set_title()
+        if len(self.nfsv4_domain.value()) > 0:
+            if not is_valid_hostname(self.nfsv4_domain.value()):
+                self.nfsv4_domain.set("")
+                self._create_warn_screen()
+                ButtonChoiceWindow(self.screen, "Network", "Invalid NFS Domain",
+                                   buttons=['Ok'])
+                self.reset_screen_colors()
+                self.gridform.draw()
+                self._set_title()
 
     def valid_rng_bytes_callback(self):
         rng_bytes = self.rng_bytes.value()
@@ -1539,19 +1547,15 @@ class NodeConfigScreen():
 
         # Save DNS servers
         dns_servers = ",".join(dns_servers)
-        if dns_servers:
-            augtool("set", "/files/" + OVIRT_DEFAULTS + "/OVIRT_DNS",
-                    '"' + dns_servers + '"')
-        else:
-            augtool("rm", "/files/" + OVIRT_DEFAULTS + "/OVIRT_DNS", "")
+        logger.debug("Setting DNS defaults to: %s" % dns_servers)
+        augtool("set", "/files/" + OVIRT_DEFAULTS + "/OVIRT_DNS",
+                '"' + dns_servers + '"')
 
         # Save NTP servers
         ntp_servers = ",".join(ntp_servers)
-        if ntp_servers:
-            augtool("set", "/files/" + OVIRT_DEFAULTS + "/OVIRT_NTP",
-                    '"' + ntp_servers + '"')
-        else:
-            augtool("rm", "/files/" + OVIRT_DEFAULTS + "/OVIRT_NTP", "")
+        logger.debug("Setting NTP defaults to: %s" % ntp_servers)
+        augtool("set", "/files/" + OVIRT_DEFAULTS + "/OVIRT_NTP",
+                '"' + ntp_servers + '"')
 
         aug.load()
 
@@ -1862,47 +1866,67 @@ class NodeConfigScreen():
         return
 
     def process_kdump_config(self):
-        ret = 0
-        if os.path.exists("/etc/kdump.conf"):
-            system("cp /etc/kdump.conf /etc/kdump.conf.old")
-        if self.kdump_nfs_type.value() == 1:
-            write_kdump_config(self.kdump_nfs_config.value())
-        elif self.kdump_ssh_type.value() == 1:
-            write_kdump_config(self.kdump_ssh_config.value())
-            self.screen.popWindow()
-            self.screen.finish()
-            # systemctl change
-            if os.path.exists("/usr/bin/kdumpctl"):
-                kdump_prop_cmd = "kdumpctl propagate"
-            else:
-                kdump_prop_cmd = "service kdump propagate"
-            propagate_proc = passthrough("clean; %s" % kdump_prop_cmd, logger.debug)
-            ret = propagate_proc.retval
-            if ret == 0:
-                ovirt_store_config("/root/.ssh/kdump_id_rsa.pub")
-                ovirt_store_config("/root/.ssh/kdump_id_rsa")
-                ovirt_store_config("/root/.ssh/known_hosts")
-                ovirt_store_config("/root/.ssh/config")
-        elif self.kdump_restore_type.value() == 1:
-            restore_kdump_config()
-        else:
-            remove_config("/etc/kdump.conf")
-            system("service kdump stop")
-            open('/etc/kdump.conf', 'w').close()
-            return
-        if not system("service kdump restart") or ret > 0:
-            self._create_warn_screen()
-            ButtonChoiceWindow(self.screen, "KDump Status",
-                               "KDump configuration failed, " +
-                               "location unreachable", buttons=['Ok'])
-            self.reset_screen_colors()
-            unmount_config("/etc/kdump.conf")
+        try:
+            ret = 0
+            if len(self.INVALID_KDUMP_MSG) > 0:
+                self._create_warn_screen()
+                ButtonChoiceWindow(self.screen, "Configuration Check",
+                                   self.INVALID_KDUMP_MSG, buttons=["Ok"])
+                self.INVALID_KDUMP_MSG = ""
+                return False
             if os.path.exists("/etc/kdump.conf"):
-                os.remove("/etc/kdump.conf")
-            system("cat /etc/kdump.conf.old > /etc/kdump.conf")
-            system("service kdump restart")
-        else:
-            ovirt_store_config("/etc/kdump.conf")
+                system("cp /etc/kdump.conf /etc/kdump.conf.old")
+            if self.kdump_nfs_type.value() == 1:
+                write_kdump_config(self.kdump_nfs_config.value())
+            elif self.kdump_ssh_type.value() == 1:
+                write_kdump_config(self.kdump_ssh_config.value())
+                self.screen.popWindow()
+                self.screen.finish()
+                # systemctl change
+                if os.path.exists("/usr/bin/kdumpctl"):
+                    kdump_prop_cmd = "kdumpctl propagate"
+                else:
+                    kdump_prop_cmd = "service kdump propagate"
+                try:
+                    ret = system_closefds("clear; %s" % kdump_prop_cmd)
+                    if ret == 0:
+                        ovirt_store_config("/root/.ssh/kdump_id_rsa.pub")
+                        ovirt_store_config("/root/.ssh/kdump_id_rsa")
+                        ovirt_store_config("/root/.ssh/known_hosts")
+                        ovirt_store_config("/root/.ssh/config")
+                except KeyboardInterrupt:
+                    ret = 1
+                    if os.path.exists("/etc/kdump.conf.old"):
+                        system("rm -f /etc/kdump.conf.old")
+                    if os.path.exists("/etc/kdump.conf"):
+                        remove_config("/etc/kdump.conf")
+                        system("rm -f /etc/kdump.conf")
+            elif self.kdump_restore_type.value() == 1:
+                restore_kdump_config()
+            else:
+                remove_config("/etc/kdump.conf")
+                system("service kdump stop")
+                open('/etc/kdump.conf', 'w').close()
+                return
+            if not system("service kdump restart") or ret > 0:
+                self._create_warn_screen()
+                ButtonChoiceWindow(self.screen, "KDump Status",
+                                   "KDump configuration failed, " +
+                                   "location unreachable", buttons=['Ok'])
+                self.reset_screen_colors()
+                if os.path.exists("/etc/kdump.conf"):
+                    os.remove("/etc/kdump.conf")
+                system("cat /etc/kdump.conf.old > /etc/kdump.conf")
+                system("service kdump restart")
+            else:
+                ovirt_store_config("/etc/kdump.conf")
+            if os.path.exists("/etc/kdump.conf.old"):
+                system("rm /etc/kdump.conf.old")
+        except KeyboardInterrupt:
+            ret = 1
+            if os.path.exists("/etc/kdump.conf"):
+                remove_config("/etc/kdump.conf")
+                system("rm -f /etc/kdump.conf")
         if os.path.exists("/etc/kdump.conf.old"):
             system("rm /etc/kdump.conf.old")
 
@@ -1956,11 +1980,11 @@ class NodeConfigScreen():
                 screen.setColor(customColorset(1), "black", "magenta")
             screen.pushHelpLine(" ")
 
-            # Draw loading msg on background:
-            self._set_title()
-            screen.drawRootText(15, 10, "Loading page ...")
-            screen.refresh()
-            time.sleep(0.2)
+            if self.__current_page == NETWORK_PAGE:
+                # Draw loading msg on background:
+                self._set_title()
+                screen.drawRootText(15, 10, "Loading page ...")
+                screen.refresh()
 
             elements = self.get_elements_for_page(screen, self.__current_page)
 
@@ -2165,24 +2189,28 @@ class NodeConfigScreen():
                                         self.__current_page = (
                                              NETWORK_DETAILS_PAGE)
                                 else:
-                                    warn = None
-                                    self._create_warn_screen()
-                                    title = "Confirm NIC Configuration"
-                                    message = ("Unsaved network changes " +
-                                      "detected, save and continue to " +
-                                      "NIC configuration?")
-                                    warn = ButtonChoiceWindow(self.screen,
-                                           title, message)
-                                    if warn == "ok":
-                                        # apply and continue
-                                        self.process_network_config()
+                                    if pressed == PING_BUTTON:
                                         self.__current_page = (
-                                            NETWORK_DETAILS_PAGE)
-                                        self.preset_network_config = None
+                                             NETWORK_PAGE)
                                     else:
-                                        # Do not apply, return
-                                        self.preset_network_config = (
-                                            current_network_config)
+                                        warn = None
+                                        self._create_warn_screen()
+                                        title = "Confirm NIC Configuration"
+                                        message = ("Unsaved network changes " +
+                                          "detected, save and continue to " +
+                                          "NIC configuration?")
+                                        warn = ButtonChoiceWindow(self.screen,
+                                               title, message)
+                                        if warn == "ok":
+                                            # apply and continue
+                                            self.process_network_config()
+                                            self.__current_page = (
+                                                NETWORK_DETAILS_PAGE)
+                                            self.preset_network_config = None
+                                        else:
+                                            # Do not apply, return
+                                            self.preset_network_config = (
+                                                current_network_config)
                         else:
                             self.__current_page = menu_choice
                         if self.net_apply_config == 1:

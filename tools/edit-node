@@ -62,8 +62,9 @@ class ExistingSparseLoopbackDisk(SparseLoopbackDisk):
         LoopbackDisk.create(self)
 
 class LiveImageEditor(LiveImageCreator):
-    def __init__(self, name):
+    def __init__(self, name, docleanup=True):
         self.name = name
+        self.docleanup = docleanup
         self.tmpdir = "/var/tmp"
         """The directory in which all temporary files will be created."""
 
@@ -716,6 +717,8 @@ class LiveImageEditor(LiveImageCreator):
             pkg = "uid-mod"
         elif options.gidmod:
             pkg = "gid-mod"
+        elif options.password:
+            pkg = "password-set"
         print "Creating Manifests"
         # Create post-image processing manifests
         cmd = "LC_ALL=C rpm -qa --qf '%%{name}-%%{version}-%%{release}.%%{arch} (%%{SIGPGP:pgpsig})\n' | sort -u > /manifest-%s-%s-rpm.txt" % (timestamp, pkg)
@@ -1070,7 +1073,8 @@ enabled=1
             valid_write_locations = [ "/etc",
                                       "/opt",
                                       "/usr/share/man",
-                                      "/usr/lib/python"]
+                                      "/usr/lib/python",
+                                      "/usr/lib/systemd"]
         elif options.install_dup:
             valid_write_locations = [ "/etc/modprobe.d",
                                       "/etc/depmod.d",
@@ -1190,7 +1194,7 @@ enabled=1
             if "," in key:
                 user, password = key.split(",")
             else:
-                user = "root"
+                user = "admin"
                 password = key
             cmd = "/usr/sbin/usermod -p \"%s\" %s" % (password, user)
             print cmd
@@ -1253,13 +1257,9 @@ def parse_options(args):
     parser = optparse.OptionParser(option_class=MultipleOption, usage = """
        %prog [-n=<name>]
                       [-o <output>]
-                      [-k <kickstart-file>]
-                      [-s <script.sh>]
                       [-w <user,encrypted password>
                       [-l <sshkeyfile>
                       [-t <tmpdir>]
-                      [-r <releasefile>]
-                      [-b <builder>]
                       [--install-kmod <kmod_pkg_name>
                       [--install-plugin <plugin_name>
                       [--install <pkg_name>
@@ -1382,7 +1382,6 @@ def main():
     if os.geteuid () != 0:
         print >> sys.stderr, "You must run edit-node as root"
         return 1
-
     if options.name:
         name = options.name
     elif stat.S_ISBLK(os.stat(LiveOS).st_mode):
@@ -1494,7 +1493,23 @@ def main():
                 editor._rebuild_initramfs()
                 editor.unmount()
                 editor.package(output)
-                logging.info("%s.iso saved to %s"  % (editor.name, output))
+                edited_iso = os.path.join(output, editor.name + ".iso")
+                if options.install_dup:
+                    n = options.install_dup
+                elif options.plugin:
+                    n = options.plugin
+                elif options.install:
+                    n = options.install
+                else:
+                    n = ""
+                if len(n) > 0:
+                    n = n + "."
+                rel_tag=LiveOS.strip(".iso").split(".")[-1]
+                finished_iso = "%s.%s%s.iso" % \
+                    (edited_iso.strip("%s.edited.iso" %rel_tag), n.replace(" ","-"), rel_tag)
+                shutil.move(edited_iso, finished_iso)
+
+                logging.info("%s.iso saved to %s"  % (editor.name, finished_iso))
             else:
                 # in manifest mode print do necessary items
                 editor.unmount()

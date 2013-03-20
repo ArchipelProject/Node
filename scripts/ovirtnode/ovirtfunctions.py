@@ -38,6 +38,7 @@ import logging
 import grp
 import pwd
 
+OVIRT_CONFIG="/config"
 OVIRT_LOGFILE="/var/log/ovirt.log"
 OVIRT_TMP_LOGFILE="/tmp/ovirt.log"
 
@@ -230,15 +231,24 @@ def check_int(var):
 # for storage - OVIRT_INIT, local disk to use
 #       if ovirt_vol is not specified, default volume sizes are set
 def is_auto_install():
-    if OVIRT_VARS.has_key("OVIRT_BOOTIF") and OVIRT_VARS.has_key("OVIRT_INIT"):
+    with open("/proc/cmdline") as cmdline:
+        for line in cmdline.readlines():
+            if "BOOTIF" in line:
+                if "storage_init" in line or "ovirt_init" in line:
+                    return True
+            else:
+                return False
+
+# return 0 if this is an upgrade
+# return 1 otherwise
+def is_upgrade():
+    if OVIRT_VARS.has_key("OVIRT_UPGRADE") and OVIRT_VARS["OVIRT_UPGRADE"] == "1":
         return True
     else:
         return False
 
-# return 0 if this is an upgrade
-# return 1 otherwise
-def is_upgrade(self):
-    if self.OVIRT_VARS.has_key("OVIRT_UPGRADE") and self.OVIRT_VARS["OVIRT_UPGRADE"] == 1:
+def is_install():
+    if OVIRT_VARS.has_key("OVIRT_INSTALL") and OVIRT_VARS["OVIRT_INSTALL"] == "1":
         return True
     else:
         return False
@@ -337,6 +347,7 @@ def is_stateless():
 def disable_firstboot():
     if os.path.ismount("/config"):
         aug.set("/files/etc/default/ovirt/OVIRT_FIRSTBOOT", "0")
+        aug.set("/files/etc/default/ovirt/OVIRT_INSTALL", "0")
         aug.set("/files/etc/default/ovirt/OVIRT_INIT", '""')
         aug.set("/files/etc/default/ovirt/OVIRT_UPGRADE", "0")
         aug.save()
@@ -463,7 +474,8 @@ def mount_live():
         live_dev="/dev/live"
 
     system_closefds("mkdir -p /live")
-    if not system_closefds("mount -r " + live_dev + " /live &>/dev/null"):
+    system_closefds("mount -r " + live_dev + " /live &>/dev/null")
+    if not os.path.ismount("/live"):
         # check if live device was setup under alternate locations
         if os.path.ismount("/dev/.initramfs/live"):
             system_closefds("mount -o bind /dev/.initramfs/live /live")
@@ -481,8 +493,10 @@ def mount_liveos():
     if os.path.ismount("/liveos"):
         return True
     else:
+        if is_iscsi_install():
+            connect_iscsi_root()
         system_closefds("mkdir -p /liveos")
-        if not system("mount LABEL=Root /liveos"):
+        if not system("mount LABEL=Root /liveos &>/dev/null"):
             # just in case /dev/disk/by-label is not using devmapper and fails
             for dev in os.listdir("/dev/mapper"):
                 if system("e2label \"/dev/mapper/" + dev + "\" 2>/dev/null|grep Root|grep -v Backup"):
@@ -490,13 +504,28 @@ def mount_liveos():
                     system("ln -s \"/dev/mapper/" + dev + "\" /dev/disk/by-label/Root")
                     if system("mount LABEL=Root /liveos"):
                         return True
+                    else:
+                        if os.path.ismount("/dev/.initramfs/live"):
+                            system_closefds("mount -o bind /dev/.initramfs/live /liveos")
+                        elif os.path.ismount("/run/initramfs/live"):
+                            system_closefds("mount -o bind /run/initramfs/live /liveos")
+                        else:
+                            return False
         else:
             return True
 
-def mount_efi():
-    efi_part = findfs("Root")
+def mount_efi(target="/liveos/efi"):
+    if os.path.ismount(target):
+        return True
+    if is_iscsi_install():
+        efi_part = findfs("Boot")
+    else:
+        efi_part = findfs("Root")
     efi_part = efi_part[:-1] + "1"
-    if system_closefds("mount -t vfat " + efi_part + " /liveos/efi"):
+    if not os.path.exists(target):
+        if not system("mkdir -v -p %s" % target):
+            logger.warning("Unable to create mount target for EFI partition")
+    if system("mount -t vfat %s %s" % (efi_part, target)):
         return True
     else:
         logger.error("Unable to mount EFI partition")
@@ -540,12 +569,43 @@ def mount_config():
         # /config is not available
         return False
 
-def mount_boot(self):
-    if os.path.ismount("/boot"):
-        return
-    else:
-        system_closefds("mkdir -p /boot")
-        system_closefds("mount LABEL=Boot /boot")
+def mount_boot():
+    system_closefds("mkdir -p /boot")
+    system_closefds("mount LABEL=Boot /boot &>/dev/null")
+
+def connect_iscsi_root():
+    mount_boot()
+    if os.path.exists("/boot/ovirt"):
+        try:
+            f = open("/boot/ovirt", 'r')
+            for line in f:
+                try:
+                    line = line.strip()
+                    key, value = line.split("\"", 1)
+                    key = key.strip("=")
+                    key = key.strip()
+                    value = value.strip("\"")
+                    if not "FIRSTBOOT" in key and not "INSTALL" in key:
+                        OVIRT_VARS[key] = value
+                except:
+                    pass
+            f.close()
+            if is_firstboot() or is_upgrade() or is_install() \
+                or not is_booted_from_local_disk():
+                iscsiadm_cmd = (("iscsiadm -p %s:%s -m discovery -t " +
+                                 "sendtargets") % (
+                                 OVIRT_VARS["OVIRT_ISCSI_TARGET_HOST"],
+                                 OVIRT_VARS["OVIRT_ISCSI_TARGET_PORT"]))
+                system(iscsiadm_cmd)
+                login_cmd = ("iscsiadm -m node -T %s -p %s:%s -l" %
+                            (OVIRT_VARS["OVIRT_ISCSI_TARGET_NAME"],
+                            OVIRT_VARS["OVIRT_ISCSI_TARGET_HOST"],
+                            OVIRT_VARS["OVIRT_ISCSI_TARGET_PORT"]))
+                system(login_cmd)
+                logger.info("Restarting iscsi service")
+                system("service iscsi restart")
+        except:
+            logger.info("Unable to connect to iscsi root")
 
 # stop any service which keeps /var/log busy
 # keep the list of services
@@ -732,6 +792,79 @@ def ovirt_store_config(files):
             rc = rc and True
     return rc
 
+def ovirt_store_config_atomic(filename, source=None):
+    rc = True
+    persist_it = True
+    if os.path.isdir(filename):
+        # ensure that, if this is a directory
+        # that it's not already persisted
+        if os.path.isdir(OVIRT_CONFIG + filename):
+            logger.warn("Directory already persisted: " + filename)
+            logger.warn("You need to unpersist its child directories " +
+                        "and/or files and try again.")
+            persist_it = False
+    elif os.path.isfile(filename):
+        # if it's a file then make sure it's not already persisted
+        if os.path.isfile(OVIRT_CONFIG + filename):
+            if not source is None:
+                md5root = md5sum(source)
+            else:
+                md5root = md5sum(filename)
+            md5stored = md5sum(OVIRT_CONFIG + filename)
+            if md5root == md5stored:
+                logger.warn("File already persisted: " + filename)
+                persist_it = False
+            else:
+                if source is not None:
+                    persist_it = True
+    if persist_it:
+        # filename - file to be persisted
+        # source - defaults to filename unless specified
+        # tmp_destination - temp file under /config before final placement
+        # final_destination - final resting place under /config
+        filename = os.path.abspath(filename)
+        dirname = os.path.dirname(filename).lstrip("/")
+        if source is None:
+            source = filename
+        final_destination = os.path.join(OVIRT_CONFIG, filename.lstrip("/"))
+        tmp_destination = None
+        try:
+            handle, tmp_destination = \
+                tempfile.mkstemp(prefix=final_destination)
+            os.close(handle)
+            if not os.path.exists(os.path.join(OVIRT_CONFIG,  dirname)):
+                os.makedirs(os.path.join(OVIRT_CONFIG,  dirname))
+            logger.debug("Copying: %s to %s" % (source, tmp_destination))
+            shutil.copyfile(source, tmp_destination)
+            shutil.copymode(source, tmp_destination)
+            f_stat = os.stat(source)
+            uid = f_stat.st_uid
+            gid = f_stat.st_gid
+            os.chown(tmp_destination, uid, gid)
+            logger.debug("Moving %s to %s" %
+                        (tmp_destination, final_destination))
+            os.rename(tmp_destination, final_destination)
+            tmp_destination = None
+            # handle non-existent files that need to be created
+            if source is not None:
+                open(filename, 'a+').close()
+            if not filename in open('/config/files','r').read():
+                with open('/config/files', 'a+') as f:
+                    f.write("%s\n" % filename)
+                    logger.info("Successfully persisted: " + filename)
+        except:
+            if tmp_destination is not None and os.path.exists(tmp_destination):
+                os.remove(tmp_destination)
+            return False
+        finally:
+            system("umount /" + final_destination.lstrip(OVIRT_CONFIG))
+            system("mount -n --bind %s /%s " %
+                  (final_destination, final_destination.lstrip(OVIRT_CONFIG)))
+    else:
+        logger.warn(filename + " Already persisted")
+        rc = rc and True
+    return rc
+
 
 def is_persisted(filename):
     abspath = os.path.abspath(filename)
@@ -884,21 +1017,23 @@ def get_live_disk():
             # if dm-XX, not enough detail to map correctly
             if "dm-" in live_disk:
                 live_disk = findfs("LIVE")[:-2]
+#    else:
+    ret = system_closefds("losetup /dev/loop0|grep -q '\.iso'")
+    if ret != 0:
+        client = gudev.Client(['block'])
+        version = open("/etc/default/version")
+        for line in version.readlines():
+            if "PACKAGE" in line:
+                pkg, pkg_name = line.split("=")
+        for device in client.query_by_subsystem("block"):
+            if device.has_property("ID_CDROM"):
+                dev = device.get_property("DEVNAME")
+                blkid_cmd = "blkid '%s'|grep -q '%s' " % (dev, pkg_name)
+                ret = system_closefds(blkid_cmd)
+                if ret == 0:
+                    live_disk = os.path.basename(dev)
     else:
-        ret = system_closefds("losetup /dev/loop0|grep -q '\.iso'")
-        if ret != 0:
-            client = gudev.Client(['block'])
-            version = open("/etc/default/version")
-            for line in version.readlines():
-                if "PACKAGE" in line:
-                    pkg, pkg_name = line.split("=")
-            for device in client.query_by_subsystem("block"):
-                if device.has_property("ID_CDROM"):
-                    dev = device.get_property("DEVNAME")
-                    blkid_cmd = "blkid '%s'|grep -q '%s' " % (dev, pkg_name)
-                    ret = system_closefds(blkid_cmd)
-                    if ret == 0:
-                        live_disk = os.path.basename(dev)
+        live_disk=""
     return live_disk
 
 # reboot wrapper
@@ -906,16 +1041,25 @@ def get_live_disk():
 
 def finish_install():
     logger.info("Completing Installation")
-    if not OVIRT_VARS.has_key("OVIRT_ISCSI_ENABLED"):
-        # setup new Root if update is prepared
-        root_update_dev = findfs("RootUpdate")
-        root_dev = findfs("Root")
-        e2label_rootbackup_cmd = "e2label '%s' RootBackup" % root_dev
-        e2label_root_cmd = "e2label '%s' Root" % root_update_dev
-        logger.debug(e2label_rootbackup_cmd)
-        logger.debug(e2label_root_cmd)
-        subprocess_closefds(e2label_rootbackup_cmd, shell=True, stdout=PIPE, stderr=STDOUT)
-        subprocess_closefds(e2label_root_cmd, shell=True, stdout=PIPE, stderr=STDOUT)
+    root_update_dev = findfs("RootUpdate")
+    root_dev = findfs("Root")
+    e2label_rootbackup_cmd = "e2label '%s' RootBackup" % root_dev
+    e2label_root_cmd = "e2label '%s' Root" % root_update_dev
+    logger.debug(e2label_rootbackup_cmd)
+    logger.debug(e2label_root_cmd)
+    subprocess_closefds(e2label_rootbackup_cmd, shell=True, stdout=PIPE, stderr=STDOUT)
+    subprocess_closefds(e2label_root_cmd, shell=True, stdout=PIPE, stderr=STDOUT)
+
+    if is_iscsi_install():
+        boot_update_dev = findfs("BootUpdate")
+        boot_dev = findfs("Boot")
+        e2label_bootbackup_cmd = "e2label '%s' BootBackup" % boot_dev
+        e2label_boot_cmd = "e2label '%s' Boot" % boot_update_dev
+        system(e2label_bootbackup_cmd)
+        system(e2label_boot_cmd)
+        system("cp /tmp/ovirt.log /boot/ovirt.log")
+        system("umount /boot")
+
     # run post-install hooks
     # e.g. to avoid reboot loops using Cobbler PXE only once
     # Cobbler XMLRPC post-install trigger (XXX is there cobbler SRV record?):
@@ -924,7 +1068,7 @@ def finish_install():
     hookdir="/etc/ovirt-config-boot.d"
     for hook in os.listdir(hookdir):
         if not is_auto_install():
-            system_closefds(os.path.join(hookdir,hook))
+            system_closefds(os.path.join(hookdir,hook) + " &> /dev/null")
     for f in ["/etc/ssh/ssh_host%s_key" % t for t in ["", "_dsa", "_rsa"]]:
         ovirt_store_config(f)
         ovirt_store_config("%s.pub" % f)
@@ -1084,7 +1228,9 @@ def is_valid_port(port_number):
         return False
 
 # Cleans partition tables
-def wipe_partitions(drive):
+def wipe_partitions(_drive):
+    drive = translate_multipath_device(_drive)
+    logger.info("Wiping partitions on: %s->%s" % (_drive, drive))
     logger.info("Removing HostVG")
     if os.path.exists("/dev/mapper/HostVG-Swap"):
         system_closefds("swapoff -a")
@@ -1093,12 +1239,14 @@ def wipe_partitions(drive):
         if "HostVG" in lv:
             system_closefds("dmsetup remove " +lv + " &>>" + OVIRT_TMP_LOGFILE)
     logger.info("Wiping old boot sector")
-    system_closefds("dd if=/dev/zero of=\""+ drive +"\" bs=1024K count=1 &>>" + OVIRT_TMP_LOGFILE)
-    # zero out the GPT secondary header
-    logger.info("Wiping secondary gpt header")
-    disk_kb = subprocess_closefds("sfdisk -s \""+ drive +"\" 2>/dev/null", shell=True, stdout=PIPE, stderr=STDOUT)
-    disk_kb_count = disk_kb.stdout.read()
-    system_closefds("dd if=/dev/zero of=\"" +drive +"\" bs=1024 seek=$(("+ disk_kb_count+" - 1)) count=1 &>>" + OVIRT_TMP_LOGFILE)
+#    system_closefds("dd if=/dev/zero of=\""+ drive +"\" bs=1024K count=1 &>>" + OVIRT_TMP_LOGFILE)
+    system_closefds("parted -s \""+ drive +"\" mklabel loop &>>" + OVIRT_TMP_LOGFILE)
+    system_closefds("wipefs -a \""+ drive +"\" &>>" + OVIRT_TMP_LOGFILE)
+    ## zero out the GPT secondary header
+    #logger.info("Wiping secondary gpt header")
+    #disk_kb = subprocess_closefds("sfdisk -s \""+ drive +"\" 2>/dev/null", shell=True, stdout=PIPE, stderr=STDOUT)
+    #disk_kb_count = disk_kb.stdout.read()
+    #system_closefds("dd if=/dev/zero of=\"" +drive +"\" bs=1024 seek=$(("+ disk_kb_count+" - 1)) count=1 &>>" + OVIRT_TMP_LOGFILE)
     system_closefds("sync")
 
 def test_ntp_configuration(self):
@@ -1133,11 +1281,13 @@ def get_dm_device(device):
             dm = "/dev/mapper/" + dm
             return dm
 
-def check_existing_hostvg(install_dev):
+def check_existing_hostvg(install_dev, vg_name=None):
+    if vg_name == None:
+        vg_name = "HostVG"
     if install_dev is "":
-        devices_cmd = "pvs --separator=\":\" -o pv_name,vg_name --noheadings 2>/dev/null| grep HostVG |awk -F \":\" {'print $1'}"
+        devices_cmd = "pvs --separator=\":\" -o pv_name,vg_name --noheadings 2>/dev/null| grep %s |awk -F \":\" {'print $1'}" % vg_name
     else:
-        devices_cmd="pvs --separator=: -o pv_name,vg_name --noheadings 2>/dev/null| grep -v '%s' | grep HostVG | awk -F: {'print $1'}" % install_dev
+        devices_cmd="pvs --separator=: -o pv_name,vg_name --noheadings 2>/dev/null| grep -v '%s' | grep %s | awk -F: {'print $1'}" % (install_dev, vg_name)
     devices_cmd = subprocess_closefds(devices_cmd, shell=True, stdout=PIPE, stderr=STDOUT)
     devices = devices_cmd.stdout.read().strip()
     if len(devices) > 0:
@@ -1145,7 +1295,7 @@ def check_existing_hostvg(install_dev):
         for device in devices.split(":"):
             logger.error(device)
         logger.error("The installation cannot proceed until the device is removed")
-        logger.error("from the system of the HostVG volume group is removed")
+        logger.error("from the system of the %s volume group is removed" % vg_name)
         return devices
     else:
         return False
@@ -1327,7 +1477,8 @@ def kvm_enabled():
         libvirt_capabilities = conn.getCapabilities()
     except:
         return 0
-    if "kvm" in libvirt_capabilities:
+    # Look for a KVM mdomain
+    if re.search("domain type=.kvm", libvirt_capabilities):
         return 1
     else:
         return 2
@@ -1374,15 +1525,29 @@ def cpu_details():
     except:
         return "(Failed to Establish Libvirt Connection)"
     dom = parseString(libvirt_capabilities)
-    vendorTag = dom.getElementsByTagName('vendor')[0].toxml()
-    modelTag = dom.getElementsByTagName('model')[0].toxml()
-    topologyTag = dom.getElementsByTagName('topology')[0].toxml()
-    cpu_model = modelTag.replace('<model>','').replace('</model>','')
-    cpu_vendor = vendorTag.replace('<vendor>','').replace('</vendor>','')
-    cpu_topology = topologyTag.replace('<topology>','').replace('</topology>','').split()
+    # get cpu section
+    cpu = parseString(dom.getElementsByTagName('cpu')[0].toxml())
+    try:
+        vendorTag = cpu.getElementsByTagName('vendor')[0].toxml()
+        cpu_vendor = vendorTag.replace('<vendor>','').replace('</vendor>','')
+    except:
+        cpu_vendor = "Unknown Vendor"
+    try:
+        modelTag = cpu.getElementsByTagName('model')[0].toxml()
+        cpu_model = modelTag.replace('<model>','').replace('</model>','')
+    except:
+        if cpu_vendor == "Unknown Vendor":
+            cpu_model = ""
+        else:
+            cpu_model = "Unknown Model"
+    try:
+        topologyTag = cpu.getElementsByTagName('topology')[0].toxml()
+        cpu_topology = topologyTag.replace('<topology>','').replace('</topology>','').split()
+    except:
+        cpu_topology = "Unknown"
     status_msg += "CPU Name: %s\n" % cpu_dict["model name"].replace("  "," ")
     status_msg += "CPU Type: %s %s\n" % (cpu_vendor, cpu_model)
-    if kvm_enabled() and virt_cpu_flags_enabled():
+    if kvm_enabled() == 1 and virt_cpu_flags_enabled():
         status_msg += "Virtualization Extensions Enabled: Yes\n"
     else:
         status_msg += "Virtualization Extensions Enabled: \n%s\n" \
@@ -1392,15 +1557,18 @@ def cpu_details():
             status_msg += "NX Flag: Yes\n"
         else:
             status_msg += "NX Flag: No\n"
-    if cpu_vendor == "AMD":
+    elif cpu_vendor == "AMD":
         if "evp" in cpu_dict["flags"]:
             status_msg += "EVP Flag: Yes\n"
         else:
             status_msg += "EVP Flag: No\n"
-    cpu_sockets=cpu_topology[2].split("=")[1].replace('"',"")
-    status_msg += "CPU Sockets: %s\n" % cpu_sockets
-    cpu_cores=cpu_topology[1].split("=")[1].replace('"',"")
-    status_msg += "CPU Cores: %s\n" % cpu_cores
+    if cpu_topology == "Unknown":
+        status_msg += "Unable to determine CPU Topology"
+    else:
+        cpu_sockets=cpu_topology[2].split("=")[1].replace('"',"")
+        status_msg += "CPU Sockets: %s\n" % cpu_sockets
+        cpu_cores=cpu_topology[1].split("=")[1].replace('"',"")
+        status_msg += "CPU Cores: %s\n" % cpu_cores
     return status_msg
 
 def get_ssh_hostkey(variant="rsa"):
@@ -1488,8 +1656,6 @@ def manage_firewall_port(port, action="open", proto="tcp"):
 def is_iscsi_install():
     if OVIRT_VARS.has_key("OVIRT_ISCSI_INSTALL") and OVIRT_VARS["OVIRT_ISCSI_INSTALL"].upper() == "Y":
         return True
-    else:
-        return False
 
 def load_keyboard_config():
     import system_config_keyboard.keyboard as keyboard
@@ -1516,7 +1682,7 @@ def is_engine_configured():
 
 def create_minimal_etc_hosts_file():
     filename = "/etc/hosts"
-    if open(filename, "r").read().strip() == "":
+    if not open(filename, "r").read().strip() == "":
         logger.info("Won't update %s, it's not empty." % filename)
         return
     if not is_persisted(filename):
@@ -1563,6 +1729,43 @@ def rng_status():
     except:
         pass
     return (bit_value, disable_aes_ni)
+
+def get_cmdline_args():
+    with open("/proc/cmdline") as cmdline:
+        args = cmdline.read().split()
+        args_dict = {}
+        for opt in args:
+            if "=" in opt:
+                if opt.count("=") == 1:
+                    key, value = opt.split("=")
+                    args_dict[key] = value
+                elif "root=" in opt:
+                    args_dict["root"] = opt.replace("root=","")
+            else:
+                args_dict[opt] = opt
+    return args_dict
+
+def remove_efi_entry(entry):
+    efi_mgr_cmd = "efibootmgr|grep '%s'" % entry
+    efi_mgr = subprocess_closefds(efi_mgr_cmd, \
+                                      shell=True, \
+                                      stdout=subprocess.PIPE, \
+                                      stderr=subprocess.STDOUT)
+    efi_out = efi_mgr.stdout.read().strip()
+    logger.debug(efi_mgr_cmd)
+    logger.debug(efi_out)
+    for line in efi_out.splitlines():
+        if not "Warning" in line:
+            num = line[4:8]  # grabs 4 digit hex id
+            cmd = "efibootmgr -B -b %s" % num
+            system(cmd)
+    return
+
+def grub2_available():
+    if os.path.exists("/sbin/grub2-install"):
+        return True
+    else:
+        return False
 
 class PluginBase(object):
     """Base class for pluggable Hypervisor configuration options.

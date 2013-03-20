@@ -1,0 +1,8 @@
+#!/bin/bash
+#
+# A wrapper to launch the ovirt-node-setup (configuration) UI
+#
+
+reset
+
+python -m ovirt.node.setup "$@"

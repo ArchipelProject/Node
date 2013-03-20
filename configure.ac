@@ -1,4 +1,4 @@
-AC_INIT([ovirt-node], [2.5.999], [node-devel@ovirt.org])
+AC_INIT([ovirt-node], [2.6.999], [node-devel@ovirt.org])
 AM_INIT_AUTOMAKE([-Wall -Werror foreign -Wno-portability tar-pax])
 
 AC_SUBST([FEDORA],[[`rpm --eval '%{fedora}'|sed 's/[^0-9]//g'`]])
@@ -60,7 +60,6 @@ AM_PATH_PYTHON
 AC_CONFIG_FILES([Makefile
                 dracut/Makefile
                 images/Makefile
-                kinit/Makefile
                 scripts/Makefile
                 tools/Makefile
                 scripts/collectd.conf

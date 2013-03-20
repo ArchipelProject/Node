@@ -25,9 +25,9 @@ import re
 import gudev
 import logging
 import subprocess
+import shlex
 
 logger = logging.getLogger(__name__)
-
 
 class Storage:
     def __init__(self):
@@ -35,7 +35,7 @@ class Storage:
         logger.propagate = False
         OVIRT_VARS = _functions.parse_defaults()
         self.overcommit = 0.5
-        self.BOOT_SIZE = 50
+        self.BOOT_SIZE = 256
         self.ROOT_SIZE = 256
         self.CONFIG_SIZE = 5
         self.LOGGING_SIZE = 2048
@@ -62,9 +62,9 @@ class Storage:
                 for disk in init:
                     skip = False
                     if disk_count < 1:
-                        self.ROOTDRIVE = disk
+                        self.ROOTDRIVE = _functions.translate_multipath_device(disk)
                         if len(init) == 1:
-                            self.HOSTVGDRIVE = disk
+                            self.HOSTVGDRIVE = _functions.translate_multipath_device(disk)
                         disk_count = disk_count + 1
                     else:
                         for hostvg in self.HOSTVGDRIVE.split(","):
@@ -111,6 +111,7 @@ class Storage:
                     return False
                 logging.info(("Setting value for %s to %s " %
                            (self.__dict__[i_short], _functions.OVIRT_VARS[i])))
+                i_short = i_short.replace("MIN_", "")
                 self.__dict__[i_short] = int(OVIRT_VARS[i])
             else:
                 logging.info("Using default value for: %s" % i_short)
@@ -122,10 +123,6 @@ class Storage:
                 for drv in _functions.OVIRT_VARS["OVIRT_INIT_APP"].split(","):
                     DRIVE = _functions.translate_multipath_device(drv)
                     self.APPVGDRIVE.append(DRIVE)
-            if not self.cross_check_host_app:
-                logger.error("Skip disk partitioning, " +
-                             "AppVG overlaps with HostVG")
-                return False
         else:
             if self.SWAP2_SIZE != 0 or self.DATA2_SIZE != 0:
                 logger.error("Missing device parameter for AppVG: " +
@@ -133,12 +130,41 @@ class Storage:
                 return False
 
     def cross_check_host_app(self):
-        for hdrv in self.HOSTVGDRIVE:
-            if hdrv in self.APPDRIVE:
-                # Skip disk partitioning, AppVG overlaps with HostVG
-                return False
-            else:
-                return True
+        logger.debug("Doing cross-check (if a device is a member of appvg " +
+                     "and hostvg)")
+        hostvg_drives = self.HOSTVGDRIVE.strip(",").split(",")
+        if self.ROOTDRIVE:
+            hostvg_drives.append(self.ROOTDRIVE)
+        # Translate to DM name as APPVG is using it
+        hostvg_drives = [_functions.translate_multipath_device(drv)
+                         for drv in hostvg_drives]
+        return Storage._xcheck_vgs(hostvg_drives, self.APPVGDRIVE)
+
+    @staticmethod
+    def _xcheck_vgs(hostvg_drives, appvg_drives):
+        """Semi-internal method to allow a better testing
+
+        APPVG and HOSTVG do not overlap:
+        >>> Storage._xcheck_vgs(["/dev/sda"], ["/dev/sdb"])
+        True
+
+        APPVG and HOSTVG do overlap (sda):
+        >>> Storage._xcheck_vgs(["sda"], ["sda", "sdb"])
+        False
+
+        APPVG and HOSTVG do not overlap:
+        >>> Storage._xcheck_vgs([], [])
+        True
+        """
+        assert type(hostvg_drives) is list
+        assert type(appvg_drives) is list
+        drives_in_both = set.intersection(set(hostvg_drives),
+                                          set(appvg_drives))
+        if drives_in_both:
+            logger.warning("The following drives are members of " +
+                           "APPVG and HOSTVG: %s" % drives_in_both)
+            return False
+        return True
 
     def get_drive_size(self, drive):
         logger.debug("Getting Drive Size For: %s" % drive)
@@ -150,6 +176,22 @@ class Storage:
         size = int(int(size) / 1024)
         logger.debug(size)
         return size
+
+    def _lvm_name_for_disk(self, disk):
+        name = None
+        cmd = "lvm pvs --noheadings --nameprefixes --unquoted -o pv_name,vg_name '%s' 2> /dev/null" % disk
+        lines = str(_functions.passthrough(cmd)).strip().split("\n")
+        if len(lines) > 1:
+            logger.warning("More than one PV for disk '%s' found: %s" % (disk,
+                                                                         lines))
+        for line in lines:
+            lvm2_vars = dict([tuple(e.split("=", 1)) for e \
+                              in shlex.split(line)])
+            if "LVM2_PV_NAME" in lvm2_vars:
+                name = lvm2_vars["LVM2_PV_NAME"]
+            else:
+                logger.debug("Found line '%s' but no LVM2_PV_NAME" % line)
+        return name
 
     def wipe_lvm_on_disk(self, _devs):
         devs = set(_devs.split(","))
@@ -168,10 +210,13 @@ class Storage:
             vg_proc = _functions.passthrough(vg_cmd, log_func=logger.debug)
             vgs_on_dev = vg_proc.stdout.split()
             for vg in vgs_on_dev:
+                name = self._lvm_name_for_disk(dev)
                 pvs_cmd = ("pvs -o pv_name,vg_uuid --noheadings | " +
-                           "grep \"%s\" | egrep -v -q \"%s" % (vg, dev))
+                           "grep \"%s\" | egrep -v -q \"%s" % (vg, name))
                 for fdev in devs:
                     pvs_cmd += "|%s%s[0-9]+|%s" % (fdev, part_delim, fdev)
+                    name = self._lvm_name_for_disk(fdev)
+                    pvs_cmd += "|%s%s[0-9]+|%s" % (name, part_delim, name)
                 pvs_cmd += "\""
                 remaining_pvs = _functions.system(pvs_cmd)
                 if remaining_pvs:
@@ -192,6 +237,7 @@ class Storage:
             # XXX fails with spaces in device names (TBI)
             # ioctl(3, DM_TABLE_LOAD, 0x966980) = -1 EINVAL (Invalid argument)
             # create/reload failed on 0QEMU   QEMU HARDDISK  drive-scsi0-0-0p1
+            _functions.system("kpartx -a '%s'" % drive)
             _functions.system("partprobe")
             # partprobe fails on cdrom:
             # Error: Invalid partition table - recursive partition on /dev/sr0.
@@ -426,7 +472,7 @@ class Storage:
                     if os.path.exists(_partpv):
                         partpv = _partpv
                         break
-                    logger.error(_partpv + " is not available!")
+                    logger.info(_partpv + " is not available!")
                 i -= 1
                 time.sleep(1)
             if i is 0:
@@ -515,6 +561,22 @@ class Storage:
             _functions.mount_data()
         logger.info("Completed HostVG Setup!")
         return True
+
+    def create_efi_partition(self):
+        if _functions.is_iscsi_install():
+            disk = self.BOOTDRIVE
+        else:
+            disk = self.ROOTDRIVE
+        parted_cmd = ("parted \"" + disk +
+                     "\" -s \"mkpart EFI 1M " +
+                     str(self.EFI_SIZE) + "M\"")
+        _functions.system(parted_cmd)
+        partefi = disk + "1"
+        if not os.path.exists(partefi):
+            partefi = disk + "p1"
+            _functions.system("ln -snf \"" + partefi + \
+                              "\" /dev/disk/by-label/EFI")
+            _functions.system("mkfs.vfat \"" + partefi + "\"")
 
     def create_iscsiroot(self):
         logger.info("Partitioning iscsi root drive: " + self.ISCSIDRIVE)
@@ -647,6 +709,10 @@ class Storage:
             logger.error("No storage device selected.")
             return False
 
+        if not self.cross_check_host_app():
+            logger.error("Skip disk partitioning, AppVG overlaps with HostVG")
+            return False
+
         if _functions.has_fakeraid(self.HOSTVGDRIVE):
             if not handle_fakeraid(self.HOSTVGDRIVE):
                 return False
@@ -658,6 +724,20 @@ class Storage:
         _functions.unmount_config("/etc/default/ovirt")
         if not self.check_partition_sizes():
             return False
+
+        # Check for still remaining HostVGs this can be the case when
+        # Node was installed on a disk not given in storage_init
+        # rhbz#872114
+        existing_vgs = str(_functions.passthrough("vgs"))
+        for vg in existing_vgs.split("\n"):
+            vg = vg.strip()
+            if "HostVG" in str(vg):
+                logger.error("An existing installation was found or not " +
+                     "all VGs could be removed.  " +
+                     "Please manually cleanup the storage using " +
+                     "standard disk tools.")
+                return False
+
         logger.info("Removing old LVM partitions")
         # HostVG must not exist at this point
         # we wipe only foreign LVM here
@@ -678,7 +758,7 @@ class Storage:
 
         self.boot_size_si = self.BOOT_SIZE * (1024 * 1024) / (1000 * 1000)
         if _functions.is_iscsi_install():
-            # login to target and setup disk"
+            # login to target and setup disk
             get_targets = ("iscsiadm -m discovery -p %s:%s -t sendtargets" %
                            (_functions.OVIRT_VARS["OVIRT_ISCSI_TARGET_HOST"],
                            _functions.OVIRT_VARS["OVIRT_ISCSI_TARGET_PORT"]))
@@ -701,27 +781,29 @@ class Storage:
             parted_cmd = "parted %s -s \"mklabel %s\"" % (self.BOOTDRIVE,
                                                           self.LABEL_TYPE)
             _functions.system(parted_cmd)
-            parted_cmd = ("parted \"%s\" -s \"mkpart primary ext2 1M %sM\"" %
-                         (self.BOOTDRIVE, self.BOOT_SIZE))
+            self.create_efi_partition()
+            boot_end_mb = self.EFI_SIZE + self.BOOT_SIZE
+            parted_cmd = ("parted \"%s\" -s \"mkpart primary ext2 %sM %sM\"" %
+                         (self.BOOTDRIVE, self.EFI_SIZE, boot_end_mb))
             _functions.system(parted_cmd)
             parted_cmd = ("parted \"%s\" -s \"mkpart primary ext2 %sM %sM\"" %
-                         (self.BOOTDRIVE, self.BOOT_SIZE, self.BOOT_SIZE*2))
+                         (self.BOOTDRIVE , boot_end_mb, boot_end_mb + self.BOOT_SIZE))
             _functions.system(parted_cmd)
             parted_cmd = ("parted \"" + self.BOOTDRIVE + "\" -s \"set 1 " +
                          "boot on\"")
             _functions.system(parted_cmd)
             self.reread_partitions(self.BOOTDRIVE)
-            partboot = self.BOOTDRIVE + "1"
+            partboot = self.BOOTDRIVE + "2"
             if not os.path.exists(partboot):
                 logger.debug("%s does not exist" % partboot)
-                partboot = self.BOOTDRIVE + "p1"
-            partbootbackup = self.BOOTDRIVE + "2"
+                partboot = self.BOOTDRIVE + "p2"
+            partbootbackup = self.BOOTDRIVE + "3"
             if not os.path.exists(partbootbackup):
                 logger.debug("%s does not exist" % partbootbackup)
-                partbootbackup = self.BOOTDRIVE + "p2"
+                partbootbackup = self.BOOTDRIVE + "p3"
+
             # sleep to ensure filesystems are created before continuing
             _functions.system("udevadm settle")
-            time.sleep(10)
             _functions.system("mke2fs \"" + str(partboot) + "\" -L Boot")
             _functions.system("tune2fs -c 0 -i 0 \"" + str(partboot) + "\"")
             _functions.system("ln -snf \"" + partboot + \
@@ -752,12 +834,8 @@ class Storage:
                          self.LABEL_TYPE + "\"")
             _functions.passthrough(parted_cmd, logger.debug)
             logger.debug("Creating Root and RootBackup Partitions")
-            # efi partition should at 0M
             if _functions.is_efi_boot():
-                parted_cmd = ("parted \"" + self.ROOTDRIVE +
-                             "\" -s \"mkpart EFI 1M " +
-                             str(self.EFI_SIZE) + "M\"")
-                _functions.passthrough(parted_cmd, logger.debug)
+                self.create_efi_partition()
             else:
                 # create partition labeled bios_grub
                 parted_cmd = ("parted \"" + self.ROOTDRIVE +
@@ -777,28 +855,19 @@ class Storage:
                          str(self.RootBackup_end) + "M\"")
             logger.debug(parted_cmd)
             _functions.system(parted_cmd)
+            _functions.system("sync ; udevadm settle ; partprobe")
             parted_cmd = ("parted \"" + self.ROOTDRIVE +
                          "\" -s \"set 2 boot on\"")
             logger.debug(parted_cmd)
             _functions.system(parted_cmd)
-            # sleep to ensure filesystems are created before continuing
-            time.sleep(5)
             # force reload some cciss devices will fail to mkfs
             _functions.system("multipath -r &>/dev/null")
             self.reread_partitions(self.ROOTDRIVE)
-            partefi = self.ROOTDRIVE + "1"
             partroot = self.ROOTDRIVE + "2"
             partrootbackup = self.ROOTDRIVE + "3"
             if not os.path.exists(partroot):
-                partefi = self.ROOTDRIVE + "p1"
                 partroot = self.ROOTDRIVE + "p2"
                 partrootbackup = self.ROOTDRIVE + "p3"
-            if _functions.is_efi_boot():
-                _functions.system("ln -snf \"" + partefi + \
-                                  "\" /dev/disk/by-label/EFI")
-                _functions.system("mkfs.vfat \"" + partefi + "\"")
-            _functions.system("ln -snf \"" + partroot + \
-                              "\" /dev/disk/by-label/Root")
             _functions.system("mke2fs \"" + partroot + "\" -L Root")
             _functions.system("tune2fs -c 0 -i 0 \"" + partroot + "\"")
             _functions.system("ln -snf \"" + partrootbackup +
@@ -842,7 +911,7 @@ class Storage:
             for drive in self.HOSTVGDRIVE.strip(",").split(","):
                 space = self.get_drive_size(drive)
                 HOSTVGDRIVESPACE = HOSTVGDRIVESPACE + space
-            ROOT_NEED_SIZE = self.ROOT_SIZE * 2
+            ROOT_NEED_SIZE = self.ROOT_SIZE * 2 + self.EFI_SIZE
             HOSTVG_NEED_SIZE = (int(self.SWAP_SIZE) + int(self.CONFIG_SIZE) +
                                 int(self.LOGGING_SIZE) + int(min_data_size))
             drive_space_dict["ROOTDRIVESPACE"] = ROOTDRIVESPACE
@@ -851,9 +920,9 @@ class Storage:
             drive_space_dict["HOSTVG_NEED_SIZE"] = HOSTVG_NEED_SIZE
             hostvg1 = self.HOSTVGDRIVE.split(",")[0]
             if self.ROOTDRIVE == hostvg1:
-                drive_list.append("ROOT")
-                ROOT_NEED_SIZE = self.ROOT_SIZE * 2 + HOSTVG_NEED_SIZE
-                drive_space_dict["ROOT_NEED_SIZE"] = ROOT_NEED_SIZE
+                drive_list.append("HOSTVG")
+                HOSTVG_NEED_SIZE = ROOT_NEED_SIZE + HOSTVG_NEED_SIZE
+                drive_space_dict["HOSTVG_NEED_SIZE"] = HOSTVG_NEED_SIZE
             else:
                 drive_list.append("ROOT")
                 drive_list.append("HOSTVG")
@@ -927,6 +996,11 @@ def storage_auto():
     if not _functions.OVIRT_VARS["OVIRT_INIT"] == "":
         #force root install variable for autoinstalls
         _functions.OVIRT_VARS["OVIRT_ROOT_INSTALL"] = "y"
+        if _functions.check_existing_hostvg("") or \
+           _functions.check_existing_hostvg("","AppVG"):
+            logger.error("HostVG/AppVG exists on a separate disk")
+            logger.error("Manual Intervention required")
+            return False
         if storage.perform_partitioning():
             return True
     else:

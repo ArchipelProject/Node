@@ -531,10 +531,15 @@ class NodeInstallScreen:
             if self.hostvg_checkbox.getEntryValue(dev)[1] == 1 and dev != "OtherDevice":
                 self.hostvg_checkbox.setEntryValue("OtherDevice", selected = 0)
             if self.hostvg_checkbox.getEntryValue("OtherDevice")[1] == 1 and dev == "OtherDevice":
-                for dev in self.dev_names:
-                    dev = translate_multipath_device(dev)
-                    self.hostvg_checkbox.setEntryValue(dev, selected = 0)
-        if "Location" in dev or "NoDevices" in dev:
+                for d in self.dev_names:
+                    if d != self.live_disk and d in self.disk_dict:
+                        # only disks from disk_dict and if it's not the live
+                        # media
+                        # self.hostvg_checkbox is populated w entries from
+                        # self.disk_dict
+                        d = translate_multipath_device(d)
+                        self.hostvg_checkbox.setEntryValue(d, selected = 0)
+        if "Location" in dev or "NoDevices" in dev or "OtherDevice" in dev:
             blank_entry = ",,,,,"
             dev_bus,dev_name,dev_size,dev_desc,dev_serial,dev_model = blank_entry.split(",",5)
         else:
@@ -564,7 +569,7 @@ class NodeInstallScreen:
                     dev_desc = pad_or_trim(32, dev_desc)
                     self.valid_disks.append(dev_name)
                     dev_name = os.path.basename(dev_name).replace(" ", "")
-                    dev_name = pad_or_trim(32, dev_name)
+                    dev_name = pad_or_trim(31, dev_name)
                     dev_entry = " %6s  %11s  %5s GB" % (dev_bus,dev_name, dev_size)
                     dev_name = translate_multipath_device(dev_name)
                     self.root_disk_menu_list.append(dev_entry, dev)
@@ -634,7 +639,7 @@ class NodeInstallScreen:
                         select_status = 0
                     # strip all "/dev/*/" references and leave just basename
                     dev_name = os.path.basename(dev_name).replace(" ", "")
-                    dev_name = pad_or_trim(32, dev_name)
+                    dev_name = pad_or_trim(31, dev_name)
                     dev_entry = " %6s %10s %2s GB" % (dev_bus,dev_name, dev_size)
                     self.hostvg_checkbox.addItem(dev_entry, (0, snackArgs['append']), item = dev, selected = select_status)
                     self.displayed_disks[dev] = ""
@@ -1024,12 +1029,11 @@ class NodeInstallScreen:
                                 if check_existing_hostvg(""):
                                     self.screen.setColor("BUTTON", "black", "red")
                                     self.screen.setColor("ACTBUTTON", "blue", "white")
-                                    msg = "Existing HostVG Detected on %s, Overwrite?" % check_existing_hostvg("")
-                                    warn = ButtonChoiceWindow(self.screen, "HostVG Check", msg)
+                                    msg = "Existing HostVG Detected on %s, Please reboot from media and choose Reinstall" % check_existing_hostvg("")
+                                    warn = ButtonChoiceWindow(self.screen, "HostVG Check", msg, buttons = ['Reboot'])
                                     self.reset_screen_colors()
                                     if warn != "ok":
-                                        self.__current_page = HOSTVG_STORAGE_PAGE
-                                        augtool("set", "/files/" + OVIRT_DEFAULTS + "/OVIRT_INIT", '"' + self.storage_init + "," + hostvg_list + '"')
+                                        self.exit_stop_boot_and_run("reboot")
                                 else:
                                     self.__current_page = STORAGE_VOL_PAGE
                     elif self.__current_page == OTHER_DEVICE_HOSTVG_PAGE:
@@ -1037,7 +1041,9 @@ class NodeInstallScreen:
                             ButtonChoiceWindow(self.screen, "HostVG Storage Selection", "You must enter a valid device", buttons = ['Ok'])
                         else:
                             if self.failed_block_dev == 0:
-                                self.hostvg_init = translate_multipath_device(self.hostvg_device.value())
+                                self.hostvg_init = ""
+                                for device in self.hostvg_device.value().split(","):
+                                    self.hostvg_init += translate_multipath_device(device) + ","
                                 hostvg_list = ""
                                 for dev in self.hostvg_init.split(","):
                                     if not tui_check_fakeraid(dev, self.screen):

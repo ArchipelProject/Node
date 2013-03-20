@@ -77,12 +77,6 @@ less
 dosfstools
 # kdump
 kexec-tools
-# qlogic firmware
-ql2100-firmware
-ql2200-firmware
-ql23xx-firmware
-ql2400-firmware
-ql2500-firmware
 # more firmwares
 aic94xx-firmware
 bfa-firmware
@@ -107,20 +101,17 @@ febootstrap-supermin-helper
 rpm-python
 # for efi installs
 efibootmgr
-# libvirt-cim
-sblim-sfcb
-libvirt-cim
 # yum for plugins
 yum
 # Consistent ethernet device naming
 biosdevname
-# yum for plugins
-yum
 fcoe-utils
 #glusterfs client packages
 glusterfs
 glusterfs-devel
 glusterfs-fuse
 glusterfs-rdma
-# mom for SLA
-mom
+
+NetworkManager-glib
+
+bridge-utils

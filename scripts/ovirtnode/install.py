@@ -80,17 +80,20 @@ class Install:
             self.grub_dir = "/liveos/grub"
             self.grub_prefix = "/grub"
 
-        if (os.path.exists("/sbin/grub2-install") and \
-            not _functions.is_efi_boot()):
+        if _functions.grub2_available():
             self.grub_prefix = self.grub_prefix + "2"
             self.grub_dir = self.grub_dir + "2"
             self.grub_config_file = "%s/grub.cfg" % self.grub_dir
         else:
-            if not _functions.is_efi_boot():
-                self.grub_config_file = "%s/grub.conf" % self.grub_dir
-            else:
-                self.grub_config_file = "/liveos/efi/EFI/redhat/grub.conf"
-                _functions.mount_efi()
+            self.grub_config_file = "%s/grub.conf" % self.grub_dir
+
+        if os.path.exists("/boot/efi/EFI/fedora"):
+            self.efi_dir_name = "fedora"
+        else:
+            self.efi_dir_name = "redhat"
+        if _functions.is_efi_boot():
+            self.grub_config_file = "/liveos/efi/EFI/%s/grub.cfg" \
+                                     % self.efi_dir_name
 
     def grub_install(self):
         if _functions.is_iscsi_install():
@@ -105,7 +108,7 @@ class Install:
 default saved
 timeout 5
 hiddenmenu
-splashimage=(hd0,%(partN)s)/grub/splash.xpm.gz
+%(splashscreen)s
 title %(product)s %(version)s-%(release)s
     root (hd0,%(partN)d)
     kernel /vmlinuz0 %(root_param)s %(bootparams)s
@@ -140,19 +143,35 @@ EOF
                 GRUB_EFIONLY_CONFIG = """%(efi_hd)s"""
                 GRUB_CONFIG_TEMPLATE = GRUB_EFIONLY_CONFIG + GRUB_CONFIG_TEMPLATE
                 self.grub_dict['efi_hd'] = "device (hd0) " + matches.group(1)
-            GRUB_CONFIG_TEMPLATE % self.grub_dict
+        if os.path.exists("/live/EFI/BOOT/splash.xpm.gz"):
+            splashscreen = "splashimage=(hd0,%s)/grub/splash.xpm.gz" \
+                % self.partN
+        else:
+            splashscreen = ""
+        self.grub_dict["splashscreen"] = splashscreen
+        GRUB_CONFIG_TEMPLATE % self.grub_dict
         grub_conf = open(self.grub_config_file, "w")
         grub_conf.write(GRUB_CONFIG_TEMPLATE % self.grub_dict)
         if self.oldtitle is not None:
             partB = 1
             if self.partN == 1:
                 partB = 2
+            if _functions.is_iscsi_install():
+                partB = 0
+                if self.partN == 0:
+                    partB = 1
             self.grub_dict['oldtitle'] = self.oldtitle
             self.grub_dict['partB'] = partB
             grub_conf.write(GRUB_BACKUP_TEMPLATE % self.grub_dict)
         grub_conf.close()
         # splashscreen
         _functions.system("cp /live/EFI/BOOT/splash.xpm.gz /liveos/grub")
+        # usb devices requires default BOOTX64 entries
+        if _functions.is_efi_boot():
+            _functions.system("mkdir -p /liveos/efi/EFI/BOOT")
+            _functions.system("cp /boot/efi/EFI/redhat/grub.efi /liveos/efi/EFI/BOOT/BOOTX64.efi")
+            _functions.system("cp /liveos/efi/EFI/redhat/grub.conf /liveos/efi/EFI/BOOT/BOOTX64.conf")
+            _functions.system("umount /liveos/efi")
         if not _functions.is_efi_boot():
             for f in ["stage1", "stage2", "e2fs_stage1_5"]:
                 _functions.system("cp /usr/share/grub/x86_64-redhat/%s %s" % \
@@ -171,7 +190,6 @@ EOF
         return True
 
     def grub2_install(self):
-
         GRUB2_EFI_CONFIG_TEMPLATE = """
 insmod efi_gop
 insmod efi_uga
@@ -192,56 +210,68 @@ menuentry "BACKUP %(oldtitle)s" {
 set root (hd0,%(partB)d)
 linux /vmlinuz0 root=live:LABEL=RootBackup %(bootparams)s
 initrd /initrd0.img
-    """
-        # if efi is detected only install grub-efi
-        if not _functions.is_efi_boot():
-            logger.info("efi not detected, installing grub2 configuraton")
-            if _functions.is_iscsi_install():
-                disk = re.sub("p[1,2,3]$", "", \
-                                        _functions.findfs(self.boot_candidate))
-            else:
-                disk = self.disk
-            grub_setup_cmd = ("/sbin/grub2-install " + disk +
-                              " --boot-directory=" + self.initrd_dest +
-                              " --force")
-            logger.info(grub_setup_cmd)
-            grub_setup = _functions.subprocess_closefds(grub_setup_cmd, \
-                                             shell=True,
-                                             stdout=subprocess.PIPE,
-                                             stderr=subprocess.STDOUT)
-            grub_results = grub_setup.stdout.read()
-            logger.info(grub_results)
-            if grub_setup.wait() != 0 or "Error" in grub_results:
-                logger.error("GRUB efi setup failed")
-                return False
-            else:
-                logger.debug("Generating Grub2 Templates")
-                grub_conf = open(self.grub_config_file, "w")
-                grub_conf.write(GRUB2_CONFIG_TEMPLATE % self.grub_dict)
+}    """
+        if _functions.is_iscsi_install():
+            disk = re.sub("p[1,2,3]$", "", \
+                                    _functions.findfs("BootNew"))
+            self.grub_dict["partN"] = int(_functions.findfs("BootNew")[-1:])
+        else:
+            disk = self.disk
+        if _functions.is_efi_boot():
+            boot_dir = self.initrd_dest + "/efi"
+        else:
+            boot_dir = self.initrd_dest
+        grub_setup_cmd = ("/sbin/grub2-install " + disk +
+                          " --boot-directory=" + boot_dir +
+                          " --root-directory=" + boot_dir +
+                          " --efi-directory=" + boot_dir +
+                          " --bootloader-id=" + self.efi_dir_name +
+                          " --force")
+        _functions.system("echo '%s' >> /liveos/efi/cmd" % grub_setup_cmd)
+        logger.info(grub_setup_cmd)
+        grub_setup = _functions.subprocess_closefds(grub_setup_cmd, \
+                                         shell=True,
+                                         stdout=subprocess.PIPE,
+                                         stderr=subprocess.STDOUT)
+        grub_results = grub_setup.stdout.read()
+        logger.info(grub_results)
+        if grub_setup.wait() != 0 or "Error" in grub_results:
+            logger.error("grub2-install Failed")
+            return False
+        else:
+            logger.debug("Generating Grub2 Templates")
+            if _functions.is_efi_boot():
+                if not os.path.exists("/liveos/efi/EFI/%s" % self.efi_dir_name):
+                    os.makedirs("/liveos/efi/EFI/%s" % self.efi_dir_name)
+            grub_conf = open(self.grub_config_file, "w")
+            grub_conf.write(GRUB2_CONFIG_TEMPLATE % self.grub_dict)
+        if self.oldtitle is not None:
+            partB = 0
+            if self.partN == 0:
+                partB = 1
+            self.grub_dict['oldtitle'] = self.oldtitle
+            self.grub_dict['partB'] = partB
+            grub_conf.write(GRUB2_BACKUP_TEMPLATE % self.grub_dict)
+        grub_conf.close()
+        if os.path.exists("/liveos/efi/EFI"):
+            efi_grub_conf = open("/liveos/efi/EFI/%s/grub.cfg" \
+                    % self.efi_dir_name, "w")
+            # inject efi console output modules
+            efi_grub_conf.write(GRUB2_EFI_CONFIG_TEMPLATE)
+            efi_grub_conf.write(GRUB2_CONFIG_TEMPLATE % self.grub_dict)
             if self.oldtitle is not None:
                 partB = 0
                 if self.partN == 0:
                     partB = 1
                 self.grub_dict['oldtitle'] = self.oldtitle
                 self.grub_dict['partB'] = partB
-                grub_conf.write(GRUB2_BACKUP_TEMPLATE % self.grub_dict)
-            grub_conf.close()
-            if os.path.exists("/liveos/efi"):
-                efi_grub_conf = open("/liveos/grub2-efi/grub.cfg", "w")
-                # inject efi console output modules
-                efi_grub_conf.write(GRUB2_EFI_CONFIG_TEMPLATE)
-                efi_grub_conf.write(GRUB2_CONFIG_TEMPLATE % self.grub_dict)
-                if self.oldtitle is not None:
-                    partB = 0
-                    if self.partN == 0:
-                        partB = 1
-                    self.grub_dict['oldtitle'] = self.oldtitle
-                    self.grub_dict['partB'] = partB
-                    efi_grub_conf.write(GRUB2_BACKUP_TEMPLATE % self.grub_dict)
+                efi_grub_conf.write(GRUB2_BACKUP_TEMPLATE % self.grub_dict)
                 efi_grub_conf.close()
-                _functions.system("umount /liveos/efi")
+            _functions.system("umount /liveos")
+            _functions.remove_efi_entry(self.efi_dir_name)
             logger.info("Grub2 Install Completed")
             return True
+        return True
 
     def ovirt_boot_setup(self, reboot="N"):
         self.generate_paths()
@@ -251,30 +281,85 @@ initrd /initrd0.img
             if OVIRT_VARS["OVIRT_ROOT_INSTALL"] == "n":
                 logger.info("Root Installation Not Required, Finished.")
                 return True
-
-        self.oldtitle = None
-        _functions.system("mount -r LABEL=Root /liveos")
+        self.oldtitle=None
+        grub_config_file = None
+        _functions.mount_liveos()
         if os.path.ismount("/liveos"):
-            if (os.path.exists("/liveos/vmlinuz0") and
-                os.path.exists("/liveos/initrd0.img")):
-                f = open(self.grub_config_file)
-                oldgrub = f.read()
-                f.close()
-                m = re.search("^title (.*)$", oldgrub, re.MULTILINE)
-                if m is not None:
-                    self.oldtitle = m.group(1)
-
+            if os.path.exists("/liveos/vmlinuz0") and os.path.exists("/liveos/initrd0.img"):
+                grub_config_file = self.grub_config_file
+        elif not _functions.is_firstboot():
+            # find existing iscsi install
+            if _functions.findfs("Boot"):
+                grub_config_file = "/boot/grub/grub.conf"
+            elif os.path.ismount("/dev/.initramfs/live"):
+                grub_config_file = "/dev/.initramfs/live/grub/grub.conf"
+            elif os.path.ismount("/run/initramfs/live"):
+                grub_config_file = "/run/initramfs/live/grub/grub.conf"
+            if is_upgrade() and not _functions.is_iscsi_install():
+                mount_liveos()
+                grub_config_file = "/liveos/grub/grub.conf"
+        if _functions.is_efi_boot():
+            logger.debug(str(os.listdir("/liveos")))
             _functions.system("umount /liveos")
+            _functions.mount_efi(target="/liveos")
+            grub_config_file = "/liveos/EFI/%s/grub.cfg" % self.efi_dir_name
+        if _functions.is_iscsi_install():
+            grub_config_file = "/boot/grub/grub.conf"
+        grub_config_file_exists = grub_config_file is not None and os.path.exists(grub_config_file)
+        logger.debug("Grub config file is: %s" % grub_config_file)
+        logger.debug("Grub config file exists: %s" % grub_config_file_exists)
+        if not grub_config_file is None and os.path.exists(grub_config_file):
+            f=open(grub_config_file)
+            oldgrub=f.read()
+            f.close()
+            if _functions.grub2_available():
+                m=re.search("^menuentry (.*)$", oldgrub, re.MULTILINE)
+            else:
+                m=re.search("^title (.*)$", oldgrub, re.MULTILINE)
+            if m is not None:
+                self.oldtitle=m.group(1)
+                # strip off extra title characters
+                if _functions.grub2_available():
+                    self.oldtitle = self.oldtitle.replace('"','').strip(" {")
+        _functions.system("umount /liveos/efi")
+        _functions.system("umount /liveos")
+        if _functions.is_iscsi_install():
+            self.boot_candidate = None
+            boot_candidate_names = ["BootBackup", "BootUpdate", "BootNew"]
+            for trial in range(1, 3):
+                time.sleep(1)
+                _functions.system("partprobe")
+                for candidate_name in boot_candidate_names:
+                    if _functions.findfs(candidate_name):
+                        self.boot_candidate = candidate_name
+                        break
+                logger.debug("Trial %s to find candidate (%s)" % \
+                             (trial, self.boot_candidate))
+                if self.boot_candidate:
+                    logger.debug("Found candidate: %s" % self.boot_candidate)
+                    break
 
-        if _functions.findfs("BootBackup"):
-            self.boot_candidate = "BootBackup"
-        elif _functions.findfs("Boot"):
-            self.boot_candidate = "Boot"
-            if not os.path.ismount("/boot"):
-                logger.error("Boot partition not available, Install Failed")
+            if not self.boot_candidate:
+                logger.error("Unable to find boot partition")
+                label_debug = ''
+                for label in os.listdir("/dev/disk/by-label"):
+                    label_debug += "%s\n" % label
+                label_debug += _functions.subprocess_closefds("blkid", \
+                                          shell=True, stdout=subprocess.PIPE,
+                                          stderr=subprocess.STDOUT).stdout.read()
+                logger.debug(label_debug)
                 return False
-            # Grab OVIRT_ISCSI VARIABLES from boot partition for upgrading
-            # file created only if OVIRT_ISCSI_ENABLED=y
+            else:
+                boot_candidate_dev = _functions.findfs(self.boot_candidate)
+            # prepare Root partition update
+            if self.boot_candidate != "BootNew":
+                e2label_cmd = "e2label \"%s\" BootNew" % boot_candidate_dev
+                logger.debug(e2label_cmd)
+                if not _functions.system(e2label_cmd):
+                    logger.error("Failed to label new Boot partition")
+                    return False
+            _functions.system("mount LABEL=%s /boot &>/dev/null" % self.boot_candidate)
+
             if os.path.exists("/boot/ovirt"):
                 try:
                     f = open("/boot/ovirt", 'r')
@@ -298,14 +383,24 @@ initrd /initrd0.img
                     _functions.system("service iscsi restart")
                 except:
                     pass
-        if _functions.findfs("RootBackup"):
-            candidate = "RootBackup"
-        elif _functions.findfs("RootUpdate"):
-            candidate = "RootUpdate"
-        elif _functions.findfs("RootNew"):
-            candidate = "RootNew"
-        else:
-            logger.error("Unable to find %s partition" % candidate)
+
+        candidate = None
+        candidate_names = ["RootBackup", "RootUpdate", "RootNew"]
+        for trial in range(1, 3):
+            time.sleep(1)
+            _functions.system("partprobe")
+            for candidate_name in candidate_names:
+                if _functions.findfs(candidate_name):
+                    candidate = candidate_name
+                    break
+            logger.debug("Trial %s to find candidate (%s)" % (trial,
+                                                              candidate))
+            if candidate:
+                logger.debug("Found candidate: %s" % candidate)
+                break
+
+        if not candidate:
+            logger.error("Unable to find root partition")
             label_debug = ''
             for label in os.listdir("/dev/disk/by-label"):
                 label_debug += "%s\n" % label
@@ -314,18 +409,14 @@ initrd /initrd0.img
                                       stderr=subprocess.STDOUT).stdout.read()
             logger.debug(label_debug)
             return False
-        logger.debug("candidate: " + candidate)
 
-        if _functions.is_iscsi_install():
-            _functions.system("mount LABEL=%s /boot" % self.boot_candidate)
         try:
             candidate_dev = self.disk = _functions.findfs(candidate)
             logger.info(candidate_dev)
             logger.info(self.disk)
             # grub2 starts at part 1
             self.partN = int(self.disk[-1:])
-            if (not os.path.exists("/sbin/grub2-install") \
-                or _functions.is_efi_boot()):
+            if not _functions.grub2_available():
                 self.partN = self.partN - 1
         except:
             logger.debug(traceback.format_exc())
@@ -356,28 +447,14 @@ initrd /initrd0.img
                 logger.info("efi detected, installing efi configuration")
                 _functions.system("mkdir /liveos/efi")
                 _functions.mount_efi()
-                _functions.system("mkdir -p /liveos/efi/EFI/redhat")
-                _functions.system("cp /boot/efi/EFI/redhat/grub.efi " +
-                       "/liveos/efi/EFI/redhat/grub.efi")
                 efi_disk = re.sub("p[1,2,3]$", "", self.disk)
                 # generate grub legacy config for efi partition
                 #remove existing efi entries
-                efi_mgr_cmd = "efibootmgr|grep '%s'" % _functions.PRODUCT_SHORT
-                efi_mgr = _functions.subprocess_closefds(efi_mgr_cmd, \
-                                              shell=True, \
-                                              stdout=subprocess.PIPE, \
-                                              stderr=subprocess.STDOUT)
-                efi_out = efi_mgr.stdout.read().strip()
-                logger.debug(efi_mgr_cmd)
-                logger.debug(efi_out)
-                for line in efi_out.splitlines():
-                    if not "Warning" in line:
-                        num = line[4:8]  # grabs 4 digit hex id
-                        cmd = "efibootmgr -B -b %s" % num
-                        _functions.system(cmd)
-                efi_mgr_cmd = ("efibootmgr -c -l '\\EFI\\redhat\\grub.efi' " +
-                              "-L '%s' -d %s -v") % (_functions.PRODUCT_SHORT,
-                                                     efi_disk)
+                _functions.remove_efi_entry(self.efi_dir_name)
+                efi_mgr_cmd = ("efibootmgr -c -l '\\EFI\\%s\\grubx64.efi' " +
+                              "-L '%s' -d %s -v") % (self.efi_dir_name,  \
+                                               _functions.PRODUCT_SHORT, \
+                                               efi_disk)
                 logger.info(efi_mgr_cmd)
                 _functions.system(efi_mgr_cmd)
         self.kernel_image_copy()
@@ -452,18 +529,23 @@ initrd /initrd0.img
         "grub_prefix": self.grub_prefix,
         "efi_hd": self.efi_hd
     }
+        if not _functions.is_firstboot():
+            if os.path.ismount("/live"):
+                with open("/live/%s/version" % self.syslinux) as version:
+                    for line in version.readlines():
+                        if "VERSION" in line:
+                            key, value = line.split("=")
+                            self.grub_dict["version"] = value.strip()
+                        if "RELEASE" in line:
+                            key, value = line.split("=")
+                            self.grub_dict["release"] = value.strip()
 
-        if os.path.exists("/sbin/grub2-install"):
-            if not _functions.is_efi_boot():
-                if not self.grub2_install():
-                    logger.error("Grub2 Installation Failed ")
-                    return False
+        if _functions.grub2_available():
+            if not self.grub2_install():
+                logger.error("Grub2 Installation Failed ")
+                return False
             else:
-                if not self.grub_install():
-                    logger.error("Grub EFI Installation Failed ")
-                    return False
-                else:
-                    logger.info("Grub EFI Installation Completed ")
+                 logger.info("Grub2 EFI Installation Completed ")
         else:
             if not self.grub_install():
                 logger.error("Grub Installation Failed ")
@@ -474,7 +556,14 @@ initrd /initrd0.img
         if _functions.is_iscsi_install():
             # copy default for when Root/HostVG is inaccessible(iscsi upgrade)
             shutil.copy(_functions.OVIRT_DEFAULTS, "/boot")
-            _functions.system("umount /boot")
+            # mark new Root ready to go, reboot() in ovirt-function switches it
+            # to active
+            e2label_cmd = "e2label \"%s\" BootUpdate" % boot_candidate_dev
+
+            if not _functions.system(e2label_cmd):
+                logger.error("Unable to relabel " + boot_candidate_dev +
+                             " to RootUpdate ")
+                return False
         else:
             _functions.system("umount /liveos/efi")
         _functions.system("umount /liveos")
@@ -487,12 +576,13 @@ initrd /initrd0.img
             return False
         _functions.disable_firstboot()
         if _functions.finish_install():
-            _iscsi.iscsi_auto()
+            if _functions.is_firstboot():
+                _iscsi.iscsi_auto()
             logger.info("Installation of %s Completed" % \
                                                       _functions.PRODUCT_SHORT)
             if reboot is not None and reboot == "Y":
                 f = open('/var/spool/cron/root', 'w')
-                f.write('* * * * * sleep 10 && /sbin/reboot')
+                f.write('* * * * * sleep 10 && /sbin/reboot\n')
                 f.close()
                 #ensure crond is started
                 _functions.subprocess_closefds("crond", shell=True,

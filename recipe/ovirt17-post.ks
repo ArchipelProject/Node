@@ -30,56 +30,26 @@ systemctl enable ovirt-firstboot.service >/dev/null 2>&1
 
 echo "Configuring IPTables"
 # here, we need to punch the appropriate holes in the firewall
-cat > /etc/sysconfig/iptables << \EOF
-# oVirt automatically generated firewall configuration
-*filter
-:INPUT ACCEPT [0:0]
-:FORWARD ACCEPT [0:0]
-:OUTPUT ACCEPT [0:0]
--A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
--A INPUT -p icmp -j ACCEPT
--A INPUT -i lo -j ACCEPT
-#vdsm
--A INPUT -p tcp --dport 54321 -j ACCEPT
-# libvirt tls
--A INPUT -p tcp --dport 16514 -j ACCEPT
-# SSH
--A INPUT -p tcp --dport 22 -j ACCEPT
-# guest consoles
--A INPUT -p tcp -m multiport --dports 5634:6166 -j ACCEPT
-# migration
--A INPUT -p tcp -m multiport --dports 49152:49216 -j ACCEPT
-# snmp
--A INPUT -p udp --dport 161 -j ACCEPT
-#
--A INPUT -j REJECT --reject-with icmp-host-prohibited
--A FORWARD -m physdev ! --physdev-is-bridged -j REJECT --reject-with icmp-host-prohibited
-COMMIT
+cat > /usr/lib/firewalld/services/ovirt.xml << \EOF
+<?xml version="1.0" encoding="utf-8"?>
+<service>
+  <short>ovirt-node</short>
+  <description>This service opens necessary ports for ovirt-node operations</description>
+  <!-- libvirt tls -->
+  <port protocol="tcp" port="16514"/>
+  <!-- guest consoles -->
+  <port protocol="tcp" port="5634-6166"/>
+  <!-- migration -->
+  <port protocol="tcp" port="49152-49216"/>
+  <!-- snmp -->
+  <port protocol="udp" port="161"/>
+</service>
 EOF
-# configure IPv6 firewall, default is all ACCEPT
-cat > /etc/sysconfig/ip6tables << \EOF
-# oVirt automatically generated firewall configuration
-*filter
-:INPUT ACCEPT [0:0]
-:FORWARD ACCEPT [0:0]
-:OUTPUT ACCEPT [0:0]
--A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
--A INPUT -p ipv6-icmp -j ACCEPT
--A INPUT -i lo -j ACCEPT
-# SSH
--A INPUT -p tcp --dport 22 -j ACCEPT
-# guest consoles
--A INPUT -p tcp -m multiport --dports 5634:6166 -j ACCEPT
-# migration
--A INPUT -p tcp -m multiport --dports 49152:49216 -j ACCEPT
-# snmp
--A INPUT -p udp --dport 161 -j ACCEPT
-# unblock ipv6 dhcp response
--A INPUT -p udp --dport 546 -j ACCEPT
--A INPUT -j REJECT --reject-with icmp6-adm-prohibited
--A FORWARD -m physdev ! --physdev-is-bridged -j REJECT --reject-with icmp6-adm-prohibited
-COMMIT
-EOF
+
+# enable required services
+firewall-offline-cmd -s ssh
+firewall-offline-cmd -s ovirt
+firewall-offline-cmd -s dhcpv6-client
 
 python -m compileall /usr/share/virt-manager
 
@@ -99,7 +69,6 @@ require {
     type passwd_t;
     type user_tmp_t;
     type var_log_t;
-    type consoletype_t;
     type net_conf_t;
     type collectd_t;
     type virt_etc_t;
@@ -136,10 +105,11 @@ require {
     class sock_file { getattr write open append };
 }
 allow mount_t shadow_t:file mounton;
-allow setfiles_t initrc_tmp_t:file append;
 allow setfiles_t net_conf_t:file read;
-allow consoletype_t var_log_t:file append;
-allow passwd_t user_tmp_t:file write;
+# Unknown on F18:
+#allow setfiles_t initrc_tmp_t:file append;
+#allow consoletype_t var_log_t:file append;
+#allow passwd_t user_tmp_t:file write;
 # Unknown on F17 brctl_t:
 #allow brctl_t net_conf_t:file read;
 # Suppose because of collectd libvirt plugin
@@ -154,11 +124,32 @@ cat > ovirt.fc << \EOF_OVIRT_FC
 /etc/rc\.d/init\.d/ovirt-firstboot             -- gen_context(system_u:object_r:ovirt_exec_t)
 /etc/rc\.d/init\.d/ovirt-post             -- gen_context(system_u:object_r:ovirt_exec_t)
 EOF_OVIRT_FC
+cat > ovirtmount.te << \EOF_OVIRT_MOUNT_TE
+policy_module(ovirtmount, 1.0)
+gen_require(`
+     type mount_t;
+')
+unconfined_domain(mount_t)
+EOF_OVIRT_MOUNT_TE
 make NAME=targeted -f /usr/share/selinux/devel/Makefile
 semodule -v -i ovirt.pp
+semodule -v -i ovirtmount.pp
 cd /
 rm -rf /tmp/SELinux
 echo "-w /etc/shadow -p wa" >> /etc/audit/audit.rules
 
-# Workaround for vdsm needing /etc/ovirt-node-image-release
+# Workaround for packages needing /etc/ovirt-node-image-release
 ln -s /etc/system-release /etc/ovirt-node-image-release
+
+#Add some upstream specific rwtab entries
+cat >> /etc/rwtab.d/ovirt << \EOF_rwtab_ovirt2
+dirs    /root/.virt-manager
+dirs    /admin/.virt-manager
+EOF_rwtab_ovirt2
+
+# create .virt-manager directories for readonly root
+mkdir -p /root/.virt-manager /home/admin/.virt-manager
+
+#symlink virt-manager-tui pointer file to .pyc version
+sed -i "s/tui.py/tui.pyc/g" /usr/bin/virt-manager-tui
+

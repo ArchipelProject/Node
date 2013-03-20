@@ -17,10 +17,15 @@
 
 pluginsdir = $(sysconfdir)/ovirt-plugins.d
 pyovirtconfigsetupdir =$(pythondir)/ovirt_config_setup
+pyovirtconfigbootdir = $(sysconfdir)/ovirt-config-boot.d
 
 dist_pyovirtconfigsetup_SCRIPTS = \
-  snmp.py
+  snmp.py \
+  cim.py
 
 dist_plugins_DATA = \
-  snmp.minimize
+  snmp.minimize \
+  cim.minimize
 
+dist_pyovirtconfigboot_SCRIPTS = \
+  snmp_autoinstall.py
