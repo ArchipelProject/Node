@@ -3,10 +3,10 @@ cifs-utils
 python-setuptools
 archipel-agent
 archipel-agent-action-scheduler
+archipel-agent-centraldb
 archipel-agent-hypervisor-geolocalization
 archipel-agent-hypervisor-health
 archipel-agent-hypervisor-network
-archipel-agent-hypervisor-platformrequest
 archipel-agent-iphone-notification
 archipel-agent-virtualmachine-oomkiller
 archipel-agent-virtualmachine-snapshoting
